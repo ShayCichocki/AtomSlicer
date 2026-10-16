@@ -81,6 +81,16 @@ The resulting toolpath can be opened using a G-code visualizer, such as [Craftwa
 
 To slice all the models in **Figure 16**, run the script `slice_all.sh` from the root folder of the repository. This may take several hours.
 
+## SIGGRAPH Version
+
+Since the initial SIGGRAPH release, the code has undergone some major bug fixes, improving scalability, performance, and path continuity. If you are interested in the original version, you can check out the following commit: `e26fce1b2e6a903bcb930c7bcc5b4109e26c53c9`.
+
+## Web Version
+
+A web version of AtomSlicer is now available: https://github.com/iota97/AtomSlicerWeb.
+
+**Note**: This version is still experimental and may be subject to changes.
+
 ## Citation
 
 If you use this code, please cite:
