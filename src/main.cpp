@@ -6,6 +6,7 @@
 #include <string>
 #include "slicer.h"
 #include "stlloader.h"
+#include "extfield.h"
 
 int main (int argc, char* argv[]) {
     if (argc < 2) {
@@ -44,7 +45,7 @@ int main (int argc, char* argv[]) {
 
     float nozzleWidth = 0.6f, layerHeightRateo = 0.5f, topAngle = 30.0f, bottomAngle = 2.0f, numberOfCover = 4.0f, collisionAngle = 95.0f;
     uint32_t zigzagOffset = 0, hardCodedField = 0;
-    const char *meshPath = argv[1], *gcode3Path = nullptr, *gcode5Path = nullptr, *plyPath = nullptr;
+    const char *meshPath = argv[1], *gcode3Path = nullptr, *gcode5Path = nullptr, *plyPath = nullptr, *wpPath = nullptr;
     bool upCollisionCheck = false, holeClosing = false;
     Infill::Type infill = Infill::Type::Gyroid;
     NormalField::Objective objective = NormalField::Objective::ConformalTop;
@@ -60,6 +61,10 @@ int main (int argc, char* argv[]) {
             bottomAngle = std::atof(argv[++i]);
         } else if (!strcmp(argv[i], "-3")) {
             gcode3Path = argv[++i];
+        } else if (std::string(argv[i]) == "-F" && i + 1 < argc) {
+            if (!ExternalField::get().load(argv[++i])) return 1;
+        } else if (std::string(argv[i]) == "-W" && i + 1 < argc) {
+            wpPath = argv[++i];
         } else if (!strcmp(argv[i], "-5")) {
             gcode5Path = argv[++i];
         } else if (!strcmp(argv[i], "-p")) {
@@ -112,6 +117,7 @@ int main (int argc, char* argv[]) {
 
     Slicer slicer(mesh.getTriangleSoup(), nozzleWidth, layerHeightRateo*nozzleWidth, topAngle, bottomAngle, infill, objective, hardCodedField, numberOfCover, zigzagOffset, collisionAngle, upCollisionCheck, holeClosing);
     if (plyPath) slicer.saveToPLY(plyPath);
+    if (wpPath) slicer.saveWaypoints(wpPath);
     if (gcode3Path) slicer.saveToGCode3Axis(gcode3Path);
     if (gcode5Path) slicer.saveToGCode(gcode5Path);
 

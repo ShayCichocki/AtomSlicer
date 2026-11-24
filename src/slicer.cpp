@@ -1,3 +1,5 @@
+#include "extfield.h"
+#include <fstream>
 // MIT License
 // Copyright 2026 Giovanni Cocco and Inria
 
@@ -22,8 +24,8 @@ Slicer::Slicer(const std::vector<std::array<Vec3, 3>> &triangles, float nozzleWi
 
     startTime = std::chrono::steady_clock::now();
     std::cout << "\nOptimizing Tool Orientations..." << std::endl;
-    if (hardCodedField == 1 /* Dragon */) {
-        objective = NormalField::Objective::SupportFree;
+    if (hardCodedField == 1 /* Dragon */ || ExternalField::get().active()) {
+        objective = NormalField::Objective::SupportFree;   // user fields use the support-free phase constraint, as for the Dragon
     }
     NormalField *normalField = new NormalField(*sdf, layerHeight, maxTopAngle, maxBottomAngle, objective, hardCodedField, numberOfCover);
     auto normals = normalField->getNormals();
@@ -83,6 +85,22 @@ void Slicer::saveToGCode(const char *path) const {
 
 void Slicer::saveToPLY(const char *path) const {
     toolpath.saveToPLY(path, layerHeight);
+}
+
+// fiveax patch: header "FXWP1" uint64 count float layerHeight, then per waypoint
+// float32 x y z nx ny nz + uint8 deposition, all in the input STL's frame (no centering).
+void Slicer::saveWaypoints(const char *path) const {
+    const auto &w = toolpath.getToolpath();
+    std::ofstream f(path, std::ios::binary);
+    const char magic[5] = {'F','X','W','P','1'};
+    f.write(magic, 5);
+    uint64_t n = w.size(); f.write(reinterpret_cast<const char*>(&n), 8);
+    float lh = layerHeight; f.write(reinterpret_cast<const char*>(&lh), 4);
+    for (const auto &p : w) {
+        float v[6] = {p.position.x, p.position.y, p.position.z, p.normal.x, p.normal.y, p.normal.z};
+        f.write(reinterpret_cast<const char*>(v), 24);
+        uint8_t d = p.deposition ? 1 : 0; f.write(reinterpret_cast<const char*>(&d), 1);
+    }
 }
 
 void Slicer::saveToGCode3Axis(const char *path) const {

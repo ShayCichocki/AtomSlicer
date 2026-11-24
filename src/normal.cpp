@@ -2,6 +2,7 @@
 // Copyright 2026 Giovanni Cocco and Inria
 
 #include "normal.h"
+#include "extfield.h"
 #include "parallel.h"
 #include <cassert>
 
@@ -10,6 +11,15 @@ NormalField::NormalField(const SDF &sdf, float layerHeight, float maxTopAngle, f
 
     // User-defined tool-orientation field for the Dragon.
     // Note: to be used with the support free objective for the correct phase constraint.
+    // fiveax patch: external (e.g. stress-derived) layer-normal field
+    if (ExternalField::get().active()) {
+        normals.resize(grid.getTotalSize());
+        Parallel::For(0, normals.size(), [this, &grid](size_t i) {
+            normals[i] = ExternalField::get().normal(grid.getPosition(i), Vec3(0.0, 0.0, 1.0));
+        });
+        return;
+    }
+
     if (hardCodedField == 1 /* Dragon */) {
         assert(objective == Objective::SupportFree);
 
@@ -90,16 +100,16 @@ NormalField::NormalField(const SDF &sdf, float layerHeight, float maxTopAngle, f
             }
         });
 
-        grid.smooth(smoothFrozen, 2);
+        grid.smoothGpu(Gpu::Kernel::NormalSmoothFrozen, nullptr, 0, smoothFrozen, 2);
 
         if (objective == Objective::ConformalSmooth) {
-            grid.optimize(smooth, restrict, prolong);
+            grid.optimizeGpu(Gpu::Kernel::NormalSmooth, nullptr, 0, smooth, restrict, prolong);
         } else {
             Parallel::ForProgress(0, grid.getTotalSize(), [this, &sdf, &grid](size_t i) {
                 grid.getData(i)->distance = isFrozen(grid.getData(i)->flags) ? fabsf(sdf.getField()[i]) : std::numeric_limits<float>::infinity();
             });
 
-            grid.smoothConvergence([](size_t i, GridHierarchy<Data> *grid) {
+            grid.smoothConvergenceGpu(Gpu::Kernel::NormalConvergeDistance, nullptr, 0, [](size_t i, GridHierarchy<Data> *grid) {
                 if (isOutside(grid->getData(i)->flags)) return false;
                 bool changed = false;
                 for (size_t n : grid->getNeighborhood(i)) {
@@ -200,7 +210,7 @@ NormalField::NormalField(const SDF &sdf, float layerHeight, float maxTopAngle, f
             grid.getData(i)->normal = norm;
         });
         
-        grid.smooth(smooth, 128);
+        grid.smoothGpu(Gpu::Kernel::NormalSmooth, nullptr, 0, smooth, 128);
     }
 
     normals.resize(grid.getTotalSize());

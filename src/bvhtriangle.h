@@ -119,6 +119,29 @@ public:
         }
     }
 
+    // Metal port: flat copy of the tree for the GPU SDF kernel. nodeBox: 6 floats per node
+    // (min xyz, max xyz); nodeInfo: 2 uints per node (triCount, firstLeft); triVerts: 9 floats
+    // per triangle in trisID order (leaf ranges index this array directly).
+    void flatten(std::vector<float> &nodeBox, std::vector<uint32_t> &nodeInfo, std::vector<float> &triVerts) const {
+        nodeBox.resize(nodes.size()*6);
+        nodeInfo.resize(nodes.size()*2);
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            for (uint8_t a = 0; a < 3; ++a) {
+                nodeBox[6*i+a] = nodes[i].minAABB[a];
+                nodeBox[6*i+3+a] = nodes[i].maxAABB[a];
+            }
+            nodeInfo[2*i+0] = uint32_t(nodes[i].triCount);
+            nodeInfo[2*i+1] = uint32_t(nodes[i].firstLeft);
+        }
+        triVerts.resize(trisID.size()*9);
+        for (size_t k = 0; k < trisID.size(); ++k) {
+            const auto &t = tris[trisID[k]];
+            const Vec3 *v[3] = {&t.a, &t.b, &t.c};
+            for (uint8_t j = 0; j < 3; ++j)
+                for (uint8_t a = 0; a < 3; ++a) triVerts[9*k+3*j+a] = (*v[j])[a];
+        }
+    }
+
     void getAABB(Vec3 &minAABB, Vec3 &maxAABB) const {
         minAABB = nodes[0].minAABB;
         maxAABB = nodes[0].maxAABB;

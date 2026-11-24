@@ -1,3 +1,4 @@
+#include "extfield.h"
 // MIT License
 // Copyright 2026 Giovanni Cocco and Inria
 
@@ -27,6 +28,14 @@ Toolpath::Toolpath(const std::vector<Mesh> &layers, const SDF &sdf, const std::v
         if (!layers[i].vertices.size() || !layers[i].triangles.size()) continue;
 
         std::vector<float> directions(layers[i].vertices.size()/3, ((i+zigzagOffset) % 4) * 0.25*M_PI);
+
+        // fiveax patch: external road-direction field (interior roads; perimeters still follow the contour)
+        if (ExternalField::get().active()) {
+            for (size_t v = 0; v < directions.size(); ++v) {
+                Vec3 p(layers[i].vertices[3*v+0], layers[i].vertices[3*v+1], layers[i].vertices[3*v+2]);
+                directions[v] = ExternalField::get().angle(p, directions[v]);
+            }
+        }
 
         // User-defined tool-tangents for the Airfoil (constant per-layer).
         if (hardCodedField == 2 /* Airfoil */) {

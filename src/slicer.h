@@ -14,6 +14,7 @@ public:
     void saveToGCode(const char *path) const;
     void saveToGCode3Axis(const char *path) const;
     void saveToPLY(const char *path) const;
+    void saveWaypoints(const char *path) const; // fiveax patch: raw waypoints in model frame
 
 private:
     Toolpath toolpath;

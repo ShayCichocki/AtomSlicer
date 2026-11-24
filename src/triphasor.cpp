@@ -14,7 +14,8 @@ TriPhasor::TriPhasor(const SDF &sdf, const SDF &originalSdf, const std::vector<V
     auto restrict = [this, layerHeight](size_t i, GridHierarchy<Data> *gridDense, GridHierarchy<Data> *gridCoarse) { restrictLayers(i, gridDense, gridCoarse, layerHeight); };
     auto smooth = [this, layerHeight](size_t i, GridHierarchy<Data> *grid) { smoothLayers(i, grid, layerHeight); };
     auto prolong = [this, layerHeight](size_t i, GridHierarchy<Data> *gridDense, GridHierarchy<Data> *gridCoarse) { prolongLayers(i, gridDense, gridCoarse, layerHeight); };
-    grid.optimize(smooth, restrict, prolong);
+    const float lhParam[1] = {layerHeight};
+    grid.optimizeGpu(Gpu::Kernel::TriSmoothLayers, lhParam, 1, smooth, restrict, prolong);
 
     std::cout << "Time: " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startTime).count()/1000.0 << " s" << std::endl;
 
@@ -23,8 +24,9 @@ TriPhasor::TriPhasor(const SDF &sdf, const SDF &originalSdf, const std::vector<V
     Parallel::For(0, grid.getTotalSize(), [this, &sdf, &grid, &normals, layerHeight, maxTopAngle, maxBottomAngle, objective](size_t i) {
         initTangents(i, sdf.getField(), normals, grid, layerHeight, maxTopAngle, maxBottomAngle, objective);
     });
-    grid.optimize(smoothTangents, restrictTangents, prolongTangents);
-    grid.smooth(smoothTangentsAll, 4);
+    const float tangFrozenAware[1] = {0.0f}, tangAll[1] = {1.0f};
+    grid.optimizeGpu(Gpu::Kernel::TriSmoothTangents, tangFrozenAware, 1, smoothTangents, restrictTangents, prolongTangents);
+    grid.smoothGpu(Gpu::Kernel::TriSmoothTangents, tangAll, 1, smoothTangentsAll, 4);
 
     std::cout << "Time: " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startTime).count()/1000.0 << " s" << std::endl;
 
@@ -38,7 +40,11 @@ TriPhasor::TriPhasor(const SDF &sdf, const SDF &originalSdf, const std::vector<V
     auto restrictTri = [this, layerHeight](size_t i, GridHierarchy<Data> *gridDense, GridHierarchy<Data> *gridCoarse) { restrictTriphasor(i, gridDense, gridCoarse, layerHeight); };
     auto smoothTri = [this, layerHeight](size_t i, GridHierarchy<Data> *grid) { smoothTriphasor(i, grid, layerHeight); };
     auto prolongTri = [this, layerHeight](size_t i, GridHierarchy<Data> *gridDense, GridHierarchy<Data> *gridCoarse) { prolongTriphasor(i, gridDense, gridCoarse, layerHeight); };
-    grid.optimize(smoothTri, restrictTri, prolongTri);
+    grid.optimizeGpu(Gpu::Kernel::TriSmoothTriphasor, lhParam, 1, smoothTri, restrictTri, prolongTri);
+    if (const char *dump = getenv("ATOM_DUMP_TRI")) {   // debug: raw cell data after the triphasor solve
+        std::ofstream f(dump, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(grid.getData(0)), grid.getTotalSize()*sizeof(Data));
+    }
 
     std::cout << "Time: " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startTime).count()/1000.0 << " s" << std::endl;
 
@@ -84,8 +90,17 @@ TriPhasor::TriPhasor(const SDF &sdf, const SDF &originalSdf, const std::vector<V
 }
 
 void TriPhasor::extractAtoms(const SDF &sdf, GridHierarchy<Data> &grid, float layerHeight) {
+#ifdef ATOM_METAL
+    std::vector<float, Gpu::PageAllocator<float>> maxVal(grid.getTotalSize(), -std::numeric_limits<float>::infinity());
+    std::vector<Vec3, Gpu::PageAllocator<Vec3>> maxPos(grid.getTotalSize(), Vec3(std::numeric_limits<float>::quiet_NaN()));
+    bool onGpu = grid.useGpu() && Gpu::extractAtoms(grid.gpuDesc(), layerHeight, cellSizeFromLayerHeight(layerHeight) * (0.5f-0.5f/8),
+                                                    maxVal.data(), &maxPos.data()->x);
+    if (onGpu) printProgress(1.0);
+    else
+#else
     std::vector<float> maxVal(grid.getTotalSize(), -std::numeric_limits<float>::infinity());
     std::vector<Vec3> maxPos(grid.getTotalSize(), Vec3(std::numeric_limits<float>::quiet_NaN()));
+#endif
     Parallel::ForProgress(0, grid.getTotalSize(), [&grid, &maxVal, &maxPos, layerHeight](size_t i) {
         if (isOutside(grid.getData(i)->flags)) return;
         Vec3 dirT = grid.getData(i)->tangent;

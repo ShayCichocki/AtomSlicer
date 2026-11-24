@@ -64,6 +64,20 @@ public:
         cv_.notify_one();
     }
 
+    // Metal-port change: push a whole batch under one lock and wake all workers once,
+    // instead of one lock + notify_one per task.
+    void enqueueBatch(size_t count, const std::function<void(size_t)> &chunk) {
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex_);
+            for (size_t t = 0; t < count; ++t) {
+                tasks_.emplace([t, &chunk]() { chunk(t); });
+            }
+            pendingTask_ += count;
+            noPendingTask_ = count == 0 && pendingTask_ == 0;
+        }
+        cv_.notify_all();
+    }
+
     void sync() {
         std::unique_lock<std::mutex> lock(queue_mutex_);
         cvPending_.wait(lock, [this]{ return noPendingTask_; });
@@ -89,19 +103,13 @@ static ThreadPool &getThreadPool() {
     return pool;
 }
 
-void Parallel::For(size_t start, size_t stop, std::function<void(size_t)> foo) {
+size_t Parallel::detail::threadCount() {
+    return getThreadPool().threadCount();
+}
+
+void Parallel::detail::runChunks(size_t N, const std::function<void(size_t)> &chunk) {
     auto &pool = getThreadPool();
-    size_t N = pool.threadCount();
-    size_t grain = (stop-start)/N + ((stop-start)%N ? 1 : 0);
-    for (size_t t = 0; t < N; ++t) {
-        size_t begin = start+t*grain, end = std::min(start+(t+1)*grain, stop);
-        auto task = [begin, end, &foo]() {
-            for (size_t i = begin; i < end; ++i) {
-                foo(i);
-            }
-        };
-        pool.enqueue(task);
-    }
+    pool.enqueueBatch(N, chunk);
     pool.sync();
 }
 
@@ -178,97 +186,3 @@ void Parallel::ForGrainProgress(size_t start, size_t stop, std::function<void(si
     pool.sync();
 }
 
-bool Parallel::ForAny(size_t start, size_t stop, std::function<bool(size_t)> foo) {
-    auto &pool = getThreadPool();
-    size_t N = pool.threadCount();
-    size_t grain = (stop-start)/N + ((stop-start)%N ? 1 : 0);
-    std::vector<uint8_t> booleans(N);
-
-    for (size_t t = 0; t < N; ++t) {
-        size_t begin = start+t*grain, end = std::min(start+(t+1)*grain, stop);
-        auto task = [begin, end, t, &foo, &booleans]() {
-            bool res = false;
-            for (size_t i = begin; i < end; ++i) {
-                res |= foo(i);
-            }
-            booleans[t] = res;
-        };
-        pool.enqueue(task);
-    }
-    pool.sync();
-
-    bool result = false;
-    for (auto b : booleans) {
-        result |= b;
-    }
-    return result;
-}
-
-std::array<bool, 2> Parallel::ForAny2(size_t start, size_t stop, std::function<std::array<bool, 2>(size_t)> foo) {
-    auto &pool = getThreadPool();
-    size_t N = pool.threadCount();
-    size_t grain = (stop-start)/N + ((stop-start)%N ? 1 : 0);
-    std::vector<uint8_t> booleans0(N);
-    std::vector<uint8_t> booleans1(N);
-
-    for (size_t t = 0; t < N; ++t) {
-        size_t begin = start+t*grain, end = std::min(start+(t+1)*grain, stop);
-        auto task = [begin, end, t, &foo, &booleans0, &booleans1]() {
-            bool res0 = false;
-            bool res1 = false;
-            for (size_t i = begin; i < end; ++i) {
-                auto val = foo(i);
-                res0 |= val[0];
-                res1 |= val[1];
-            }
-            booleans0[t] = res0;
-            booleans1[t] = res1;
-
-        };
-        pool.enqueue(task);
-    }
-    pool.sync();
-
-    std::array<bool, 2> result{false, false};
-    for (size_t i = 0; i < N; ++i) {
-        result[0] |= booleans0[i];
-        result[1] |= booleans1[i];
-    }
-    return result;
-}
-
-size_t Parallel::ArgMin(size_t start, size_t stop, std::function<float(size_t)> foo) {
-    struct FS { float f; size_t s; };
-
-    auto &pool = getThreadPool();
-    size_t N = pool.threadCount();
-    size_t grain = (stop-start)/N + ((stop-start)%N ? 1 : 0);
-    std::vector<FS> values(N);
-
-    for (size_t t = 0; t < N; ++t) {
-        size_t begin = start+t*grain, end = std::min(start+(t+1)*grain, stop);
-        auto task = [begin, end, t, &foo, &values]() {
-            float val = std::numeric_limits<float>::infinity();
-            size_t id = 0;
-            for (size_t i = begin; i < end; ++i) {
-                float newVal = foo(i);
-                if (newVal < val) {
-                    val = newVal;
-                    id = i;
-                }
-            }
-            values[t] = {val, id};
-        };
-        pool.enqueue(task);
-    }
-    pool.sync();
-
-    FS result{std::numeric_limits<float>::infinity(), 0};
-    for (auto v : values) {
-        if (v.f < result.f) {
-            result = v;
-        }
-    }
-
-    return result.s;
-}

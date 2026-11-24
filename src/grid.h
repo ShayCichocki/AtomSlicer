@@ -5,6 +5,7 @@
 
 #include "mathutils.h"
 #include "parallel.h"
+#include "metal/gpu.h"
 #include <vector>
 #include <array>
 #include <memory>
@@ -17,6 +18,11 @@
 template <class T>
 class GridHierarchy {
 public:
+#ifdef ATOM_METAL
+    using Storage = std::vector<T, Gpu::PageAllocator<T>>;   // page aligned: wrapped as a Metal buffer
+#else
+    using Storage = std::vector<T>;
+#endif
     GridHierarchy(const std::array<uint32_t, 3> &size, float cellSize, Vec3 origin = Vec3(0)) : size(size), cellSize(cellSize), origin(origin) {
         data.resize(size_t(size[0])*size[1]*size[2]);
         Downsample();
@@ -76,38 +82,41 @@ public:
         return cellSize*Vec3(coord[0]+0.5, coord[1]+0.5, coord[2]+0.5) + origin;
     }
 
+    // Metal-port change: the cell coordinates are decoded once per cell instead of once per
+    // neighbour step. The visiting order (+x, -x, +y, -y, +z, -z) is unchanged.
     struct NeighborhoodIter {
         const GridHierarchy<T> *grid;
         size_t i;
         uint8_t j;
         size_t p;
-        NeighborhoodIter(const GridHierarchy<T> *grid, size_t i) : grid(grid), i(i), j(0) {
+        std::array<uint32_t, 3> coord;
+        NeighborhoodIter(const GridHierarchy<T> *grid, size_t i) : grid(grid), i(i), j(0), coord(grid->idx1To3(i)) {
             ++(*this);
         }
 
         NeighborhoodIter(const GridHierarchy<T> *grid, size_t i, size_t j) : grid(grid), i(i), j(j) {}
 
         NeighborhoodIter &operator++() {
+            const size_t sz = grid->size[2], syz = size_t(grid->size[1])*grid->size[2];
             do {
-                auto coord = grid->idx1To3(i);
                 switch (j++) {
                 case 0:
-                    p = coord[0] < grid->size[0]-1 ? grid->idx3To1(coord[0]+1, coord[1], coord[2]) : size_t(-1);
+                    p = coord[0] < grid->size[0]-1 ? i + syz : size_t(-1);
                     break;
                 case 1:
-                    p = coord[0] > 0 ? grid->idx3To1(coord[0]-1, coord[1], coord[2]) : size_t(-1);
+                    p = coord[0] > 0 ? i - syz : size_t(-1);
                     break;
                 case 2:
-                    p = coord[1] < grid->size[1]-1 ? grid->idx3To1(coord[0], coord[1]+1, coord[2]) : size_t(-1);
+                    p = coord[1] < grid->size[1]-1 ? i + sz : size_t(-1);
                     break;
                 case 3:
-                    p = coord[1] > 0 ? grid->idx3To1(coord[0], coord[1]-1, coord[2]) : size_t(-1);
+                    p = coord[1] > 0 ? i - sz : size_t(-1);
                     break;
                 case 4:
-                    p = coord[2] < grid->size[2]-1 ? grid->idx3To1(coord[0], coord[1], coord[2]+1) : size_t(-1);
+                    p = coord[2] < grid->size[2]-1 ? i + 1 : size_t(-1);
                     break;
                 case 5:
-                    p = coord[2] > 0 ? grid->idx3To1(coord[0], coord[1], coord[2]-1) : size_t(-1);
+                    p = coord[2] > 0 ? i - 1 : size_t(-1);
                     break;
                 default:
                     break;
@@ -143,13 +152,15 @@ public:
     typedef std::function<void(size_t, GridHierarchy<T> *, GridHierarchy<T> *)> RestrictFunction;
     typedef std::function<void(size_t, GridHierarchy<T> *, GridHierarchy<T> *)> ProlongFunction;
 
-    void init(const InitFunction &initFunc) {
+    template <class InitF>
+    void init(const InitF &initFunc) {
         Parallel::For(0, data.size(), [this, &initFunc](size_t i) {
             initFunc(i, this);
         });
     }
 
-    void optimize(const SmoothFunction &smoothFunc, const RestrictFunction &restrictFunc, const ProlongFunction &prolongFunc, uint32_t iterationCount = 32, bool quiet = false) {
+    template <class SmoothF, class RestrictF, class ProlongF>
+    void optimize(const SmoothF &smoothFunc, const RestrictF &restrictFunc, const ProlongF &prolongFunc, uint32_t iterationCount = 32, bool quiet = false) {
         if (coarse) {
             restrict(restrictFunc);
             coarse->optimize(smoothFunc, restrictFunc, prolongFunc, iterationCount, true);
@@ -159,9 +170,9 @@ public:
     }
 
     T *getData(size_t i) { return &data[i]; }
-    std::vector<T> *getData() { return &data; }
+    Storage *getData() { return &data; }
     const T *getData(size_t i) const { return &data[i]; }
-    const std::vector<T> *getData() const { return &data; }
+    const Storage *getData() const { return &data; }
 
     typedef std::function<float(size_t, const GridHierarchy<T> *)> FloatFunction;
     typedef std::function<std::array<uint8_t, 3>(size_t, const GridHierarchy<T>*, bool& save)> ColorFunction;
@@ -433,31 +444,83 @@ public:
     const std::array<uint32_t, 3> & getSize() const { return size; }
     float getCellSize() const { return cellSize; }
 
-    void smooth(const SmoothFunction &smoothFunc, uint32_t iterationCount = 32, bool quiet = true) {
+    // Metal-port change: each half-sweep visits only the cells of the active colour, row by
+    // row (z stride 2), instead of visiting every cell and skipping half. Same cells, same
+    // per-cell arithmetic; cells of one colour never read each other, so order is irrelevant.
+    template <class Body>
+    void forColour(uint32_t parity, const Body &body) {
+        const size_t sy = size[1], sz = size[2];
+        Parallel::For(0, size_t(size[0])*sy, [&](size_t row) {
+            size_t x = row/sy, y = row%sy;
+            size_t z0 = (x + y + parity) & 1;
+            size_t base = row*sz;
+            for (size_t z = z0; z < sz; z += 2) body(base + z);
+        });
+    }
+
+    template <class Body>
+    bool forColourAny(uint32_t parity, const Body &body) {
+        const size_t sy = size[1], sz = size[2];
+        return Parallel::ForAny(0, size_t(size[0])*sy, [&](size_t row) {
+            size_t x = row/sy, y = row%sy;
+            size_t z0 = (x + y + parity) & 1;
+            size_t base = row*sz;
+            bool changed = false;
+            for (size_t z = z0; z < sz; z += 2) changed |= body(base + z);
+            return changed;
+        });
+    }
+
+    template <class SmoothF>
+    void smooth(const SmoothF &smoothFunc, uint32_t iterationCount = 32, bool quiet = true) {
         for (uint32_t iter = 0; iter < 2*iterationCount; ++iter) {
             if (!quiet) {
                 printProgress(float(iter)/(2*iterationCount-1));
             }
-            Parallel::For(0, size[0]*size[1]*size[2], [this, &smoothFunc, iter](size_t i) {
-                auto coord = idx1To3(i);
-                if ((coord[0] + coord[1] + coord[2]) % 2 == iter % 2) {
-                    smoothFunc(i, this);
-                }
-            });
+            forColour(iter % 2, [this, &smoothFunc](size_t i) { smoothFunc(i, this); });
         }
     }
 
-    void smoothConvergence(const SmoothConvergenceFunction &smoothFunc) {
+    template <class SmoothF>
+    void smoothConvergence(const SmoothF &smoothFunc) {
         for (uint32_t iter = 0;; ++iter) {
-            bool changed = Parallel::ForAny(0, size[0]*size[1]*size[2], [this, &smoothFunc, iter](size_t i) {
-                auto coord = idx1To3(i);
-                if ((coord[0] + coord[1] + coord[2]) % 2 == iter % 2) {
-                    return smoothFunc(i, this);
-                }
-                return false;
-            });
+            bool changed = forColourAny(iter % 2, [this, &smoothFunc](size_t i) { return bool(smoothFunc(i, this)); });
             if (!changed) break;
         }
+    }
+
+    // ---- Metal port: GPU variants. Each falls back to the CPU template above when the GPU
+    // is not available, the grid is small, or the GPU call fails.
+    Gpu::GridDesc gpuDesc() {
+        Gpu::GridDesc g;
+        g.data = data.data(); g.cellCount = data.size(); g.cellStride = sizeof(T);
+        g.size[0] = size[0]; g.size[1] = size[1]; g.size[2] = size[2];
+        g.cellSize = cellSize; g.origin[0] = origin.x; g.origin[1] = origin.y; g.origin[2] = origin.z;
+        return g;
+    }
+
+    bool useGpu() const { return Gpu::available() && data.size() >= Gpu::minCells(); }
+
+    template <class SmoothF>
+    void smoothGpu(Gpu::Kernel k, const float *params, uint32_t nparams, const SmoothF &smoothFunc, uint32_t iterationCount = 32, bool quiet = true) {
+        if (useGpu() && Gpu::smooth(k, gpuDesc(), params, nparams, iterationCount, !quiet)) return;
+        smooth(smoothFunc, iterationCount, quiet);
+    }
+
+    template <class SmoothF, class RestrictF, class ProlongF>
+    void optimizeGpu(Gpu::Kernel k, const float *params, uint32_t nparams, const SmoothF &smoothFunc, const RestrictF &restrictFunc, const ProlongF &prolongFunc, uint32_t iterationCount = 32, bool quiet = false) {
+        if (coarse) {
+            restrict(restrictFunc);
+            coarse->optimizeGpu(k, params, nparams, smoothFunc, restrictFunc, prolongFunc, iterationCount, true);
+            prolong(prolongFunc);
+            smoothGpu(k, params, nparams, smoothFunc, iterationCount, quiet);
+        }
+    }
+
+    template <class SmoothF>
+    void smoothConvergenceGpu(Gpu::Kernel k, const float *params, uint32_t nparams, const SmoothF &smoothFunc) {
+        if (useGpu() && Gpu::smoothConvergence(k, gpuDesc(), params, nparams) >= 0) return;
+        smoothConvergence(smoothFunc);
     }
 
 private:
@@ -475,19 +538,21 @@ private:
         }
     }
 
-    void restrict(const RestrictFunction &restrictFunc) {
+    template <class RestrictF>
+    void restrict(const RestrictF &restrictFunc) {
         Parallel::For(0, coarse->data.size(), [this, &restrictFunc](size_t i) {
             restrictFunc(i, this, coarse);
         });
     }
 
-    void prolong(const ProlongFunction &prolongFunc) {
+    template <class ProlongF>
+    void prolong(const ProlongF &prolongFunc) {
         Parallel::For(0, data.size(), [this, &prolongFunc](size_t i) {
             prolongFunc(i, this, coarse);
         });
     }
 
-    std::vector<T> data;
+    Storage data;
     std::array<uint32_t, 3> size;
     float cellSize;
     Vec3 origin;

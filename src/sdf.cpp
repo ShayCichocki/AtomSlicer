@@ -4,6 +4,8 @@
 #include "sdf.h"
 #include "bvhtriangle.h"
 #include "parallel.h"
+#include "metal/gpu.h"
+#include <cmath>
 
 SDF::SDF(const std::vector<std::array<Vec3, 3>> &triangles, float cellSize, uint32_t border, uint32_t raysCount, bool quiet) : cellSize(cellSize), origin(-float(border*cellSize)) {
     BVHTriangle bvh(triangles);
@@ -16,7 +18,7 @@ SDF::SDF(const std::vector<std::array<Vec3, 3>> &triangles, float cellSize, uint
     size[2] = uint32_t(ceilf(deltaAABB.z/cellSize)+2*border);
     field.resize(size_t(size[0])*size[1]*size[2]);
 
-    Parallel::ForGrainProgress(0, field.size(), [&](size_t i) {
+    auto cellValue = [&](size_t i) {
         size_t x = i/size[1]/size[2], y = (i/size[2])%size[1], z = i % size[2];
         Vec3 point = cellSize*Vec3(x, y, z)+0.5*cellSize + offset;
         Vec3 closest = bvh.closestPoint(point);
@@ -29,7 +31,31 @@ SDF::SDF(const std::vector<std::array<Vec3, 3>> &triangles, float cellSize, uint
         }
         float sign = outside > raysCount/2 ? -1 : 1;
         field[i] = sign * delta.length();
-    }, 4096, quiet);
+    };
+
+    // Metal port: same per-cell computation on the GPU; cells whose BVH stack overflowed
+    // come back NaN and are redone here.
+    if (Gpu::available() && field.size() >= Gpu::minCells()) {
+        std::vector<float> nodeBox, triVerts;
+        std::vector<uint32_t> nodeInfo;
+        bvh.flatten(nodeBox, nodeInfo, triVerts);
+        Gpu::SdfParams p;
+        p.size[0] = size[0]; p.size[1] = size[1]; p.size[2] = size[2]; p.raysCount = raysCount;
+        p.cellSize = cellSize; p.half = float(0.5*cellSize);
+        p.offset[0] = offset.x; p.offset[1] = offset.y; p.offset[2] = offset.z;
+        p.tri0[0] = triangles[0][0].x; p.tri0[1] = triangles[0][0].y; p.tri0[2] = triangles[0][0].z;
+        if (Gpu::sdf(nodeBox, nodeInfo, triVerts, p, field.data(), !quiet)) {
+            std::vector<size_t> redo;
+            for (size_t i = 0; i < field.size(); ++i) if (std::isnan(field[i])) redo.push_back(i);
+            if (redo.size()) {
+                fprintf(stderr, "[metal] sdf: %zu cells redone on CPU (BVH stack)\n", redo.size());
+                Parallel::For(0, redo.size(), [&](size_t k) { cellValue(redo[k]); });
+            }
+            return;
+        }
+    }
+
+    Parallel::ForGrainProgress(0, field.size(), cellValue, 4096, quiet);
 }
 
 SDF::SDF(const char* path) {
