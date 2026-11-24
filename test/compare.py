@@ -16,7 +16,8 @@ Exit code 0 = PASS, 1 = FAIL (strict tolerances).
 floating-point contraction changed (-ffp-contract=off). That is the pipeline's own float
 noise floor: ulp-level field changes flip discrete choices (atom picks, path routing) and
 move whole path pieces by up to a bead width. FLOOR verdict = new vs ref is no worse than
-FLOOR_FACTOR x (floor vs ref) on position p99/max, and strict on volume, axis and layers.
+FLOOR_FACTOR x (floor vs ref) on position p99/max, and strict on volume, axis and layers (axis is judged
+against the floor too when the floor itself exceeds the strict axis limit: fragmented partitions).
 
 Coverage: fraction of resampled deposit points of one plan lying within half a bead width
 (= layer height) of the other plan's deposit points, both ways (min reported).
@@ -136,6 +137,11 @@ def main():
     if 'floor' in out:
         fl = out['floor']
         other = [f for f in fails if not f.startswith('pos ')]
+        # Fragmented partitions (thousands of layers) let rounding flip which piece prints at which nozzle angle:
+        # there the CPU-vs-CPU float floor itself breaks the strict axis limit, so judge axis against the floor too
+        # (only when the floor already exceeds the strict limit; otherwise the axis check stays strict).
+        if fl['axis_p99_deg'] > TOL['axis_p99_deg'] and out['axis_p99_deg'] <= FLOOR_FACTOR * fl['axis_p99_deg']:
+            other = [f for f in other if not f.startswith('axis ')]
         ok = (out['pos_p99'] <= max(TOL['pos_p99'], FLOOR_FACTOR * fl['pos_p99']) and
               out['pos_max'] <= max(TOL['pos_max'], FLOOR_FACTOR * fl['pos_max']) and not other)
         out['floor_result'] = 'PASS' if ok else 'FAIL'
