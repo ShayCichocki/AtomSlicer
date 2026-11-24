@@ -311,7 +311,7 @@ struct SdfInfo {
     float cellSize, halfCell, ox, oy, oz;   // point = ((cellSize*c) + halfCell) + offset
     float tri0x, tri0y, tri0z;          // tris[0].a, the CPU's initial "closest"
     float eps_hi, eps_lo;               // 1e-4 (double) as a float pair
-    uint pad;
+    uint pad;                           // toolpath-speedup: 1 = ray tree buffers are bound
 };
 
 static inline float stdmin(float a, float b) { return (b < a) ? b : a; }   // std::min
@@ -410,25 +410,17 @@ static inline bool intersectBox(float3 o, float3 dir, float3 mn, float3 mx) {
 
 #define SDF_STACK 64
 
-kernel void sdf_cells(device const float *box [[buffer(0)]], device const uint *info [[buffer(1)]],
-                      device const float *tris [[buffer(2)]], constant SdfInfo &g [[buffer(3)]],
-                      device float *field [[buffer(4)]], constant uint &first [[buffer(5)]],
-                      constant uint &count [[buffer(6)]], uint tid [[thread_position_in_grid]]) {
-    if (tid >= count) return;
-    uint i = first + tid;
-    uint syz = g.sy*g.sz;
-    uint x = i / syz, r = i - x*syz, y = r / g.sz, z = r - y*g.sz;
-    float3 point = float3(float(x)*g.cellSize, float(y)*g.cellSize, float(z)*g.cellSize);
-    point = float3(point.x + g.halfCell, point.y + g.halfCell, point.z + g.halfCell);
-    point = float3(point.x + g.ox, point.y + g.oy, point.z + g.oz);
-
-    // closest point
-    float3 closest = float3(g.tri0x, g.tri0y, g.tri0z);
-    float minD2 = INFINITY;
+// Toolpath-speedup change: closest-point search as before, with an optional upper bound ub2
+// on the squared distance (INFINITY = none). The bound only prunes boxes farther than it, so
+// the leaves still visited come in the same order and the same triangle wins; returns minD2
+// (== ub2 when nothing beat the bound, and the caller then searches again without it).
+static inline float sdfClosest(float3 point, float ub2, device const float *box, device const uint *info,
+                               device const float *tris, constant SdfInfo &g, thread float3 &closest, thread bool &overflow) {
+    closest = float3(g.tri0x, g.tri0y, g.tri0z);
+    float minD2 = ub2;
     uint stack[SDF_STACK];
     uint sp = 0;
     stack[sp++] = 0;
-    bool overflow = false;
     while (sp && !overflow) {
         uint idx = stack[--sp];
         while (true) {
@@ -463,14 +455,62 @@ kernel void sdf_cells(device const float *box [[buffer(0)]], device const uint *
             }
         }
     }
+    return minD2;
+}
 
-    // ray parity vote
+struct SdfRayTreeBufs {
+    device const float *box; device const uint *info; device const uint *leaves; device const uint *parent;
+};
+
+// Same chain of box tests as the original traversal, from an original leaf up to the root.
+static inline bool sdfChain(float3 o, float3 dir, uint n, device const float *box, device const uint *parent) {
+    for (uint guard = 0; guard < 4096u; ++guard) {
+        if (!intersectBox(o, dir, nodeMin(box, n), nodeMax(box, n))) return false;
+        if (n == 0) return true;
+        n = parent[n];
+    }
+    return true;
+}
+
+static inline uint sdfVotes(float3 point, uint i, device const float *box, device const uint *info,
+                            device const float *tris, constant SdfInfo &g, thread bool &overflow,
+                            SdfRayTreeBufs rt) {
+    uint stack[SDF_STACK];
     uint outside = 0;
     uint seed = i;
     for (uint j = 0; j < g.raysCount && !overflow; ++j) {
         float3 dir = rngDir(seed);
         uint hits = 0;
-        sp = 0;
+        uint sp = 0;
+        if (g.pad && dir.x != 0.0f && dir.y != 0.0f && dir.z != 0.0f) {
+            // Toolpath-speedup change: candidates from the SAH ray tree, then the original
+            // triangle test and box chain (BVHTriangle::rayHits; same count).
+            stack[sp++] = 0;
+            while (sp) {
+                uint n = stack[--sp];
+                if (!intersectBox(point, dir, nodeMin(rt.box, n), nodeMax(rt.box, n))) continue;
+                uint first = rt.info[2*n], cnt = rt.info[2*n+1];
+                if (cnt > 0) {
+                    for (uint c = first; c < first + cnt; ++c) {
+                        uint leaf = rt.leaves[c];
+                        int chain = -1;
+                        uint triCount = info[2*leaf], firstLeft = info[2*leaf+1];
+                        for (uint k = firstLeft; k < firstLeft + triCount; ++k) {
+                            if (!intersectTri(point, dir, triV(tris, k, 0), triV(tris, k, 1), triV(tris, k, 2))) continue;
+                            if (chain < 0) chain = sdfChain(point, dir, leaf, box, rt.parent) ? 1 : 0;
+                            hits += uint(chain);
+                        }
+                    }
+                } else {
+                    if (sp + 2 > SDF_STACK) { overflow = true; break; }
+                    stack[sp++] = first + 1;
+                    stack[sp++] = first;
+                }
+            }
+            outside += hits % 2;
+            seed = rngUint(seed);
+            continue;
+        }
         stack[sp++] = 0;
         while (sp) {
             uint n = stack[--sp];
@@ -488,8 +528,50 @@ kernel void sdf_cells(device const float *box [[buffer(0)]], device const uint *
         outside += hits % 2;
         seed = rngUint(seed);
     }
-    if (overflow) { field[i] = NAN; return; }
-    float sign = outside > g.raysCount/2 ? -1.0f : 1.0f;
-    float3 delta = point - closest;
-    field[i] = sign * vlen(delta);
+    return outside;
+}
+
+// Toolpath-speedup change: one SIMD group (32 threads) per block of 4 (x) * 8 (y) rows and
+// SDF_RUN cells along z; each thread walks its z run, so every cell after the first gets the
+// previous cell's distance + cellSize as a bound (same values as the one-cell-per-thread
+// version, fewer boxes visited, and neighbouring threads query nearby points).
+#define SDF_RUN 8
+kernel void sdf_cells(device const float *box [[buffer(0)]], device const uint *info [[buffer(1)]],
+                      device const float *tris [[buffer(2)]], constant SdfInfo &g [[buffer(3)]],
+                      device float *field [[buffer(4)]], constant uint &first [[buffer(5)]],
+                      constant uint &count [[buffer(6)]],
+                      device const float *rtBox [[buffer(7)]], device const uint *rtInfo [[buffer(8)]],
+                      device const uint *rtLeaves [[buffer(9)]], device const uint *rtParent [[buffer(10)]],
+                      uint tid [[thread_position_in_grid]]) {
+    SdfRayTreeBufs rt{rtBox, rtInfo, rtLeaves, rtParent};
+    uint blockLocal = tid / 32u, lane = tid % 32u;
+    if (blockLocal >= count) return;
+    uint block = first + blockLocal;
+    uint nby = (g.sy + 7u) / 8u, nbz = (g.sz + SDF_RUN - 1u) / SDF_RUN;
+    uint bz = block % nbz, rest = block / nbz, by = rest % nby, bx = rest / nby;
+    uint x = bx*4u + lane/8u, y = by*8u + lane%8u;
+    if (x >= g.sx || y >= g.sy) return;
+    float prev = INFINITY;
+    for (uint c = 0; c < SDF_RUN; ++c) {
+        uint z = bz*SDF_RUN + c;
+        if (z >= g.sz) break;
+        uint i = (x*g.sy + y)*g.sz + z;
+        float3 point = float3(float(x)*g.cellSize, float(y)*g.cellSize, float(z)*g.cellSize);
+        point = float3(point.x + g.halfCell, point.y + g.halfCell, point.z + g.halfCell);
+        point = float3(point.x + g.ox, point.y + g.oy, point.z + g.oz);
+
+        float ub2 = INFINITY;
+        if (c > 0 && isfinite(prev)) { float u = prev + g.cellSize; ub2 = u*u*1.0001f + 1e-6f; }
+        bool overflow = false;
+        float3 closest;
+        float minD2 = sdfClosest(point, ub2, box, info, tris, g, closest, overflow);
+        if (!overflow && !isinf(ub2) && minD2 == ub2) minD2 = sdfClosest(point, INFINITY, box, info, tris, g, closest, overflow);
+        uint outside = overflow ? 0u : sdfVotes(point, i, box, info, tris, g, overflow, rt);
+        if (overflow) { field[i] = NAN; prev = INFINITY; continue; }
+        float sign = outside > g.raysCount/2 ? -1.0f : 1.0f;
+        float3 delta = point - closest;
+        float v = vlen(delta);
+        field[i] = sign * v;
+        prev = v;
+    }
 }

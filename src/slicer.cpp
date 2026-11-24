@@ -13,7 +13,11 @@
 #include "snapper.h"
 
 #include <chrono>
+#include <cstdlib>
+#include <string>
 #include <iostream>
+#include <cstdio>
+#include <cstdlib>
 
 Slicer::Slicer(const std::vector<std::array<Vec3, 3>> &triangles, float nozzleWidth, float layerHeight, float maxTopAngle, float maxBottomAngle, Infill::Type infillType, NormalField::Objective objective, uint32_t hardCodedField, float numberOfCover, uint32_t zigzagOffset, float nozzleConeAngle, bool upCollisionCheck, bool holeClosing) : layerHeight(layerHeight) {
     auto startTime = std::chrono::steady_clock::now();
@@ -50,6 +54,23 @@ Slicer::Slicer(const std::vector<std::array<Vec3, 3>> &triangles, float nozzleWi
 
     startTime = std::chrono::steady_clock::now();
     std::cout << "\nPartitioning..." << std::endl;
+    // partition-wip: ATOM_PART_DUMP=file writes the partition inputs (for tools/partbench);
+    // ATOM_PART_DUMP_EXIT=1 then stops. Does not change any output.
+    if (const char *dump = getenv("ATOM_PART_DUMP")) {
+        FILE *f = fopen(dump, "wb");
+        uint64_t n = points.size();
+        uint8_t up = upCollisionCheck;
+        fwrite("FXPD", 1, 4, f);
+        fwrite(&n, 8, 1, f);
+        fwrite(&layerHeight, 4, 1, f);
+        fwrite(&nozzleConeAngle, 4, 1, f);
+        fwrite(&up, 1, 1, f);
+        fwrite(points.data(), sizeof(Vec3), n, f);
+        fwrite(normals.data(), sizeof(Vec3), n, f);
+        fclose(f);
+        std::cout << "Partition input dumped to " << dump << std::endl;
+        if (getenv("ATOM_PART_DUMP_EXIT")) exit(0);
+    }
     Partition partition(points, normals, layerHeight, nozzleConeAngle, upCollisionCheck);
 
     std::cout << "Layers: " << partition.getLayers().size() << std::endl;
@@ -62,6 +83,23 @@ Slicer::Slicer(const std::vector<std::array<Vec3, 3>> &triangles, float nozzleWi
     //partition.savePartitionToPLY("../data/test.ply");
     //meshing.saveLayersToPLY("../data/layers/");
     std::cout << "Time: " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startTime).count()/1000.0 << " s" << std::endl;
+
+    // Toolpath-speedup dev aid: ATOM_DUMP_TOOLPATH=<file> saves the toolpath stage's inputs so
+    // tools/tp_bench can rerun just that stage (old vs new code) on a big model.
+    if (const char *dump = getenv("ATOM_DUMP_TOOLPATH")) {
+        std::ofstream f(dump, std::ios::binary);
+        auto w = [&f](const void *p, size_t n) { f.write(reinterpret_cast<const char *>(p), n); };
+        uint64_t n = meshing.getLayers().size(); w(&n, 8);
+        for (const auto &l : meshing.getLayers()) {
+            uint64_t a = l.vertices.size(), b = l.triangles.size(); w(&a, 8); w(&b, 8);
+            w(l.vertices.data(), 4*a); w(l.triangles.data(), 4*b);
+        }
+        n = points.size(); w(&n, 8); w(points.data(), 12*n); w(normals.data(), 12*n);
+        w(&nozzleWidth, 4); w(&layerHeight, 4); w(&hardCodedField, 4); w(&zigzagOffset, 4);
+        uint8_t hc = holeClosing; w(&hc, 1);
+        f.close();
+        originalSDF->saveToBin((std::string(dump) + ".sdf").c_str());
+    }
 
     startTime = std::chrono::steady_clock::now();
     std::cout << "\nToolpath generation..." << std::endl;

@@ -50,13 +50,21 @@ struct SdfParams {
     float cellSize, half, offset[3];
     float tri0[3];
 };
+// Toolpath-speedup change: optional ray tree (BVHTriangle::flattenRayTree); empty = old traversal.
+struct SdfRayTree {
+    std::vector<float> box;          // 6 floats per ray node
+    std::vector<uint32_t> info;      // first, count per ray node (count > 0: leaf)
+    std::vector<uint32_t> leaves;    // original leaf node ids
+    std::vector<uint32_t> parent;    // original tree parents
+};
 // SDF constructor loop on the GPU. Writes field[0..cells); a cell whose BVH stack overflowed
 // is NaN and must be recomputed on the CPU by the caller.
 bool sdf(const std::vector<float> &nodeBox, const std::vector<uint32_t> &nodeInfo, const std::vector<float> &triVerts,
-         const SdfParams &p, float *field, bool progress);
+         const SdfParams &p, float *field, bool progress, const SdfRayTree *rayTree = nullptr);
 #else
 struct SdfParams { uint32_t size[3], raysCount; float cellSize, half, offset[3]; float tri0[3]; };
-inline bool sdf(const std::vector<float> &, const std::vector<uint32_t> &, const std::vector<float> &, const SdfParams &, float *, bool) { return false; }
+struct SdfRayTree { std::vector<float> box; std::vector<uint32_t> info, leaves, parent; };
+inline bool sdf(const std::vector<float> &, const std::vector<uint32_t> &, const std::vector<float> &, const SdfParams &, float *, bool, const SdfRayTree * = nullptr) { return false; }
 inline bool extractAtoms(const GridDesc &, float, float, float *, float *) { return false; }
 inline bool available() { return false; }
 inline bool smooth(Kernel, const GridDesc &, const float *, uint32_t, uint32_t, bool) { return false; }

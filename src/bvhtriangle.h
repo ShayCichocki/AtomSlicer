@@ -4,6 +4,8 @@
 #pragma once
 #include "mathutils.h"
 #include <vector>
+#include <algorithm>
+#include <limits>
 #include <array>
 #include <unordered_set>
 #include <iostream>
@@ -24,48 +26,112 @@ public:
         build();
     }
 
-    Vec3 closestPoint(const Vec3 &point, size_t *triangleID = nullptr) const {
+    // Toolpath-speedup change: same traversal (same tests, same child order) as before, with a
+    // fixed-size stack instead of a heap-allocated std::vector per query, and the leaf
+    // triangles read from a copy stored in leaf order (no trisID indirection).
+    // upperBound2 (optional, used by the SDF) is a guess larger than the squared distance to
+    // the closest triangle. It only prunes subtrees whose boxes are farther than it, so the
+    // leaves still visited come in the same order and the first triangle reaching the minimum
+    // (the one returned) is the same; if no triangle beats the guess the query is redone
+    // without it.
+    Vec3 closestPoint(const Vec3 &point, size_t *triangleID = nullptr, float upperBound2 = std::numeric_limits<float>::infinity()) const {
+        if (!(upperBound2 < std::numeric_limits<float>::infinity())) upperBound2 = std::numeric_limits<float>::infinity();
         Vec3 closest = tris[0].a;
         if (triangleID) *triangleID = 0;
-        float minDistance2 = std::numeric_limits<float>::infinity();
+        float minDistance2 = upperBound2;
 
-        std::vector<size_t> stack{0};
+        Stack stack;
+        stack.push(0);
         while (stack.size()) {
-            size_t idx = stack.back();
-            stack.pop_back();
+            uint32_t idx = stack.pop();
             while (true) {
                 if (!sphereAABBIntersection(point, minDistance2 + 1e-4, nodes[idx].minAABB, nodes[idx].maxAABB)) break;
                 if (nodes[idx].isLeaf()) {
-                   for (size_t offset = nodes[idx].firstLeft, last = offset + nodes[idx].triCount; offset < last; ++offset) {
-                        size_t triIdx = trisID[offset];
-                        Vec3 triClosest = closestPointOnTriangle(point, tris[triIdx].a, tris[triIdx].b, tris[triIdx].c);
+                   for (uint32_t offset = nodes[idx].firstLeft, last = offset + nodes[idx].triCount; offset < last; ++offset) {
+                        const Tris &t = leafTris[offset];
+                        Vec3 triClosest = closestPointOnTriangle(point, t.a, t.b, t.c);
                         float distance2 = (triClosest-point).length2();
                         if (distance2 < minDistance2) {
                             minDistance2 = distance2;
                             closest = triClosest;
-                            if (triangleID) *triangleID = triIdx;
+                            if (triangleID) *triangleID = trisID[offset];
                         }
                     }
                     break;
                 }
-                size_t leftIdx = nodes[idx].firstLeft;
-                size_t rightIdx = leftIdx + 1;
+                uint32_t leftIdx = nodes[idx].firstLeft;
+                uint32_t rightIdx = leftIdx + 1;
 
                 if (pointAABBIntersection(point, nodes[leftIdx].minAABB, nodes[leftIdx].maxAABB)) {
                     idx = leftIdx;
-                    stack.push_back(rightIdx);
+                    stack.push(rightIdx);
                 } else if (pointAABBIntersection(point, nodes[rightIdx].minAABB, nodes[rightIdx].maxAABB)) {
                     idx = rightIdx;
-                    stack.push_back(leftIdx);
+                    stack.push(leftIdx);
                 } else {
                     float leftDist2 = pointAABBDistance2(point, nodes[leftIdx].minAABB, nodes[leftIdx].maxAABB);
                     float rightDist2 = pointAABBDistance2(point, nodes[rightIdx].minAABB, nodes[rightIdx].maxAABB);
                     idx = leftDist2 < rightDist2 ? leftIdx : rightIdx;
-                    stack.push_back(leftDist2 < rightDist2 ? rightIdx : leftIdx);
+                    stack.push(leftDist2 < rightDist2 ? rightIdx : leftIdx);
                 }
             }
         }
+        if (minDistance2 == upperBound2 && upperBound2 != std::numeric_limits<float>::infinity()) {
+            return closestPoint(point, triangleID);
+        }
         return closest;
+    }
+
+    // Toolpath-speedup change: intersectionCount() through a second tree built for rays.
+    //
+    // intersectionCount(o, d) counts the triangles t that pass intersectTriangle and whose
+    // whole chain of boxes (root .. leaf) passes intersectAABB. rayHits() gives the same
+    // number: it finds candidate leaves with a SAH tree whose every box contains the boxes of
+    // the original leaves below it, then for each candidate runs the same triangle test and
+    // the same chain of box tests as the original. The candidate set cannot miss a counted
+    // triangle: with no zero direction component (no 0/0, so no NaN), each slab bound in
+    // intersectAABB is a correctly rounded, hence monotone, function of the box bounds, so a
+    // box containing a passing box also passes. Rays with a zero component use the original
+    // traversal. Call buildRayTree() once before rayHits().
+    void buildRayTree() {
+        parent.assign(nodes.size(), 0);
+        std::vector<uint32_t> leaves;
+        for (uint32_t n = 0; n < nodes.size(); ++n) {
+            if (nodes[n].isLeaf()) leaves.push_back(n);
+            else { parent[nodes[n].firstLeft] = n; parent[nodes[n].firstLeft+1] = n; }
+        }
+        rayNodes.clear();
+        rayLeaves.clear();
+        if (leaves.empty()) return;
+        rayNodes.push_back(RayNode());
+        buildRayNode(0, leaves, 0, uint32_t(leaves.size()));
+    }
+
+    size_t rayHits(const Vec3 &origin, const Vec3 &dir) const {
+        if (rayNodes.empty() || dir.x == 0.0f || dir.y == 0.0f || dir.z == 0.0f) return intersectionCount(origin, dir);
+        size_t hits = 0;
+        Stack stack;
+        stack.push(0);
+        while (stack.size()) {
+            const RayNode &n = rayNodes[stack.pop()];
+            if (!intersectAABB(origin, dir, n.minAABB, n.maxAABB)) continue;
+            if (n.count) {
+                for (uint32_t c = n.first; c < n.first + n.count; ++c) {
+                    uint32_t leaf = rayLeaves[c];
+                    int chain = -1;   // unknown / 0 fails / 1 passes
+                    for (uint32_t k = nodes[leaf].firstLeft, last = k + nodes[leaf].triCount; k < last; ++k) {
+                        const Tris &t = leafTris[k];
+                        if (!intersectTriangle(origin, dir, t.a, t.b, t.c)) continue;
+                        if (chain < 0) chain = chainPasses(origin, dir, leaf);
+                        hits += chain;
+                    }
+                }
+            } else {
+                stack.push(n.first + 1);
+                stack.push(n.first);
+            }
+        }
+        return hits;
     }
 
     size_t intersectionCount(const Vec3 &origin, const Vec3 &dir, size_t nodeIdx = 0) const {
@@ -142,23 +208,131 @@ public:
         }
     }
 
+    // Toolpath-speedup change: flat copy of the ray tree for the GPU (see Gpu::SdfRayTree).
+    void flattenRayTree(std::vector<float> &box, std::vector<uint32_t> &info, std::vector<uint32_t> &leaves, std::vector<uint32_t> &parents) const {
+        box.resize(rayNodes.size()*6);
+        info.resize(rayNodes.size()*2);
+        for (size_t i = 0; i < rayNodes.size(); ++i) {
+            for (uint8_t a = 0; a < 3; ++a) { box[6*i+a] = rayNodes[i].minAABB[a]; box[6*i+3+a] = rayNodes[i].maxAABB[a]; }
+            info[2*i+0] = rayNodes[i].first; info[2*i+1] = rayNodes[i].count;
+        }
+        leaves = rayLeaves;
+        parents = parent;
+    }
+
     void getAABB(Vec3 &minAABB, Vec3 &maxAABB) const {
         minAABB = nodes[0].minAABB;
         maxAABB = nodes[0].maxAABB;
     }
 
 private:
-    struct Node {
+    struct Node {   // Toolpath-speedup change: 32 bytes (was 40), same values
         Vec3 minAABB;
         Vec3 maxAABB;
-        size_t triCount;
-        size_t firstLeft;
+        uint32_t triCount;
+        uint32_t firstLeft;
         bool isLeaf() const { return triCount > 0; }
     };
+
+    // Small fixed stack with a heap fallback (traversal depth is the tree depth, normally < 64).
+    template <class T>
+    struct SmallStack {
+        T fixed[96];
+        std::vector<T> spill;
+        size_t n = 0;
+        void push(T v) { if (n < 96) fixed[n] = v; else { spill.resize(n-96+1); spill[n-96] = v; } ++n; }
+        T pop() { --n; return n < 96 ? fixed[n] : spill[n-96]; }
+        size_t size() const { return n; }
+    };
+    using Stack = SmallStack<uint32_t>;
 
     struct Tris {
         Vec3 a, b, c, centroid;
     };
+
+    struct RayNode {
+        Vec3 minAABB, maxAABB;
+        uint32_t first = 0, count = 0;   // leaf: rayLeaves[first .. first+count); else children first, first+1
+    };
+    std::vector<RayNode> rayNodes;
+    std::vector<uint32_t> rayLeaves;   // original leaf node ids
+    std::vector<uint32_t> parent;      // original tree, parent[0] = 0
+
+    bool chainPasses(const Vec3 &origin, const Vec3 &dir, uint32_t n) const {
+        while (true) {
+            if (!intersectAABB(origin, dir, nodes[n].minAABB, nodes[n].maxAABB)) return false;
+            if (n == 0) return true;
+            n = parent[n];
+        }
+    }
+
+    // Binned SAH over the original leaves; node boxes are unions of the original leaf boxes.
+    void buildRayNode(uint32_t self, std::vector<uint32_t> &leaves, uint32_t begin, uint32_t end) {
+        Vec3 mn(std::numeric_limits<float>::infinity()), mx(-std::numeric_limits<float>::infinity());
+        Vec3 cmn = mn, cmx = mx;
+        for (uint32_t i = begin; i < end; ++i) {
+            const Node &l = nodes[leaves[i]];
+            for (uint8_t a = 0; a < 3; ++a) {
+                mn[a] = std::min(mn[a], l.minAABB[a]); mx[a] = std::max(mx[a], l.maxAABB[a]);
+                float c = 0.5f*(l.minAABB[a] + l.maxAABB[a]);
+                cmn[a] = std::min(cmn[a], c); cmx[a] = std::max(cmx[a], c);
+            }
+        }
+        rayNodes[self].minAABB = mn; rayNodes[self].maxAABB = mx;
+        uint32_t count = end - begin;
+        auto area = [](const Vec3 &a, const Vec3 &b) { Vec3 e = b - a; return e.x*e.y + e.y*e.z + e.z*e.x; };
+        int bestAxis = -1; uint32_t bestBin = 0; float bestCost = std::numeric_limits<float>::infinity();
+        constexpr uint32_t B = 16;
+        if (count > 2) {
+            for (uint8_t a = 0; a < 3; ++a) {
+                float ext = cmx[a] - cmn[a];
+                if (!(ext > 0)) continue;
+                Vec3 bmn[B], bmx[B]; uint32_t bc[B];
+                for (uint32_t b = 0; b < B; ++b) { bmn[b] = Vec3(std::numeric_limits<float>::infinity()); bmx[b] = Vec3(-std::numeric_limits<float>::infinity()); bc[b] = 0; }
+                for (uint32_t i = begin; i < end; ++i) {
+                    const Node &l = nodes[leaves[i]];
+                    float c = 0.5f*(l.minAABB[a] + l.maxAABB[a]);
+                    uint32_t b = std::min(B-1, uint32_t((c - cmn[a])/ext*B));
+                    bc[b]++;
+                    for (uint8_t q = 0; q < 3; ++q) { bmn[b][q] = std::min(bmn[b][q], l.minAABB[q]); bmx[b][q] = std::max(bmx[b][q], l.maxAABB[q]); }
+                }
+                for (uint32_t split = 1; split < B; ++split) {
+                    Vec3 lmn(std::numeric_limits<float>::infinity()), lmx(-std::numeric_limits<float>::infinity()), rmn = lmn, rmx = lmx;
+                    uint32_t lc = 0, rc = 0;
+                    for (uint32_t b = 0; b < B; ++b) {
+                        if (!bc[b]) continue;
+                        Vec3 &tmn = b < split ? lmn : rmn; Vec3 &tmx = b < split ? lmx : rmx;
+                        for (uint8_t q = 0; q < 3; ++q) { tmn[q] = std::min(tmn[q], bmn[b][q]); tmx[q] = std::max(tmx[q], bmx[b][q]); }
+                        (b < split ? lc : rc) += bc[b];
+                    }
+                    if (!lc || !rc) continue;
+                    float cost = lc*area(lmn, lmx) + rc*area(rmn, rmx);
+                    if (cost < bestCost) { bestCost = cost; bestAxis = a; bestBin = split; }
+                }
+            }
+        }
+        float leafCost = count*area(mn, mx);
+        if (bestAxis < 0 || count <= 2 || (count <= 4 && bestCost >= leafCost)) {
+            rayNodes[self].first = uint32_t(rayLeaves.size());
+            rayNodes[self].count = count;
+            for (uint32_t i = begin; i < end; ++i) rayLeaves.push_back(leaves[i]);
+            return;
+        }
+        float ext = cmx[bestAxis] - cmn[bestAxis];
+        auto mid = std::partition(leaves.begin() + begin, leaves.begin() + end, [&](uint32_t id) {
+            const Node &l = nodes[id];
+            float c = 0.5f*(l.minAABB[bestAxis] + l.maxAABB[bestAxis]);
+            return std::min(B-1, uint32_t((c - cmn[bestAxis])/ext*B)) < bestBin;
+        });
+        uint32_t m = uint32_t(mid - leaves.begin());
+        if (m == begin || m == end) m = begin + count/2;
+        uint32_t left = uint32_t(rayNodes.size());
+        rayNodes.push_back(RayNode()); rayNodes.push_back(RayNode());
+        rayNodes[self].first = left; rayNodes[self].count = 0;
+        buildRayNode(left, leaves, begin, m);
+        buildRayNode(left + 1, leaves, m, end);
+    }
+    std::vector<Tris> leafTris;   // tris[trisID[k]] for every k, filled after build()
 
     std::vector<Node> nodes;
     std::vector<Tris> tris;
@@ -167,9 +341,11 @@ private:
     void build() {
         nodes.push_back(Node());
         nodes[0].firstLeft = 0;
-        nodes[0].triCount = trisID.size();
+        nodes[0].triCount = uint32_t(trisID.size());
         updateLastBounds();
         subdivideNodes();
+        leafTris.resize(trisID.size());
+        for (size_t k = 0; k < trisID.size(); ++k) leafTris[k] = tris[trisID[k]];
     }
 
     void updateLastBounds() {
@@ -252,13 +428,13 @@ private:
                 if (leftCount > 0 && leftCount < nodes[idx].triCount) {
                     Node leftNode;
                     leftNode.firstLeft = nodes[idx].firstLeft;
-                    leftNode.triCount = leftCount;
-                    nodes[idx].firstLeft = nodes.size();
+                    leftNode.triCount = uint32_t(leftCount);
+                    nodes[idx].firstLeft = uint32_t(nodes.size());
                     stack.push_back(nodes.size());
 
                     Node rightNode;
-                    rightNode.firstLeft = i;
-                    rightNode.triCount = nodes[idx].triCount - leftCount;
+                    rightNode.firstLeft = uint32_t(i);
+                    rightNode.triCount = uint32_t(nodes[idx].triCount - leftCount);
                     nodes[idx].triCount = 0;
                     stack.push_back(nodes.size()+1);
 

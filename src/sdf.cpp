@@ -6,9 +6,12 @@
 #include "parallel.h"
 #include "metal/gpu.h"
 #include <cmath>
+#include <algorithm>
+#include <limits>
 
 SDF::SDF(const std::vector<std::array<Vec3, 3>> &triangles, float cellSize, uint32_t border, uint32_t raysCount, bool quiet) : cellSize(cellSize), origin(-float(border*cellSize)) {
     BVHTriangle bvh(triangles);
+    bvh.buildRayTree();   // toolpath-speedup: faster, same-count ray votes (BVHTriangle::rayHits)
     Vec3 minAABB, maxAABB;
     bvh.getAABB(minAABB, maxAABB);
     Vec3 deltaAABB = maxAABB-minAABB;
@@ -18,15 +21,18 @@ SDF::SDF(const std::vector<std::array<Vec3, 3>> &triangles, float cellSize, uint
     size[2] = uint32_t(ceilf(deltaAABB.z/cellSize)+2*border);
     field.resize(size_t(size[0])*size[1]*size[2]);
 
-    auto cellValue = [&](size_t i) {
+    // Toolpath-speedup change: upperBound2 = a bound on this cell's squared distance from the
+    // previous cell in z (same row, one cellSize away), padded for rounding; it only lets the
+    // closest-point query skip far subtrees and gives the same value (see closestPoint).
+    auto cellValue = [&](size_t i, float upperBound2) {
         size_t x = i/size[1]/size[2], y = (i/size[2])%size[1], z = i % size[2];
         Vec3 point = cellSize*Vec3(x, y, z)+0.5*cellSize + offset;
-        Vec3 closest = bvh.closestPoint(point);
+        Vec3 closest = bvh.closestPoint(point, nullptr, upperBound2);
         Vec3 delta = point-closest;
         uint32_t outside = 0;
         uint32_t seed = i;
         for (uint32_t j = 0; j < raysCount; ++j) {
-            outside += bvh.intersectionCount(point, randomDirectionFromUint(seed)) % 2;
+            outside += bvh.rayHits(point, randomDirectionFromUint(seed)) % 2;
             seed = randomUintFromUint(seed);
         }
         float sign = outside > raysCount/2 ? -1 : 1;
@@ -44,18 +50,34 @@ SDF::SDF(const std::vector<std::array<Vec3, 3>> &triangles, float cellSize, uint
         p.cellSize = cellSize; p.half = float(0.5*cellSize);
         p.offset[0] = offset.x; p.offset[1] = offset.y; p.offset[2] = offset.z;
         p.tri0[0] = triangles[0][0].x; p.tri0[1] = triangles[0][0].y; p.tri0[2] = triangles[0][0].z;
-        if (Gpu::sdf(nodeBox, nodeInfo, triVerts, p, field.data(), !quiet)) {
+        // The ray tree pays off on the GPU only for bigger meshes (measured: 1.33x faster on a
+        // 10850-triangle part, 15% slower on a 508-triangle one); same field either way.
+        Gpu::SdfRayTree rayTree;
+        if (triangles.size() >= 4096) bvh.flattenRayTree(rayTree.box, rayTree.info, rayTree.leaves, rayTree.parent);
+        if (Gpu::sdf(nodeBox, nodeInfo, triVerts, p, field.data(), !quiet, &rayTree)) {
             std::vector<size_t> redo;
             for (size_t i = 0; i < field.size(); ++i) if (std::isnan(field[i])) redo.push_back(i);
             if (redo.size()) {
                 fprintf(stderr, "[metal] sdf: %zu cells redone on CPU (BVH stack)\n", redo.size());
-                Parallel::For(0, redo.size(), [&](size_t k) { cellValue(redo[k]); });
+                Parallel::For(0, redo.size(), [&](size_t k) { cellValue(redo[k], std::numeric_limits<float>::infinity()); });
             }
             return;
         }
     }
 
-    Parallel::ForGrainProgress(0, field.size(), cellValue, 4096, quiet);
+    // One task per run of whole z rows (about 4096 cells, as before), so each cell after the
+    // first of its row has its neighbour's distance as a bound.
+    size_t rows = size_t(size[0])*size[1], rowGrain = std::max<size_t>(1, 4096/std::max<uint32_t>(1, size[2]));
+    Parallel::ForGrainProgress(0, rows, [&](size_t r) {
+        size_t first = r*size[2];
+        float prev = std::numeric_limits<float>::infinity();
+        for (size_t z = 0; z < size[2]; ++z) {
+            float bound = std::numeric_limits<float>::infinity();
+            if (z > 0) { float u = prev + cellSize; bound = u*u*1.0001f + 1e-6f; }
+            cellValue(first + z, bound);
+            prev = fabsf(field[first + z]);
+        }
+    }, rowGrain, quiet);
 }
 
 SDF::SDF(const char* path) {

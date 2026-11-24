@@ -9,6 +9,9 @@
 #include <set>
 #include <unordered_set>
 #include <deque>
+#include <array>
+#include <vector>
+#include <algorithm>
 
 Stitcher::Stitcher(const float *vertsPosition, const float *vertsNormal, const uint32_t *triangles, uint32_t vertsCount, uint32_t facesCount, const std::set<std::array<uint32_t, 2>>& borderEdges, const SDF& sdf)
         : vertsCount(vertsCount), facesCount(facesCount), borderEdges(borderEdges), sdf(&sdf) {
@@ -547,16 +550,40 @@ void Stitcher::generateAdjacency() {
     orderAdjacency();
 }
 
+// Toolpath-speedup change: same walk around each interior vertex as before, but the two
+// lookups it needs come from flat arrays instead of an unordered_map of vectors (vertex ->
+// faces, only the first face was used) and a std::map of vectors (edge -> faces, only the
+// first two were used). Both arrays are filled in face order, as the push_backs were, so
+// every lookup returns the same face and the adjacency order is unchanged.
 void Stitcher::orderAdjacency() {
     Edge *edgesTMP = new Edge[edgesCount];
-    std::unordered_map<uint32_t, std::vector<uint32_t>> vertsFaces;
-    std::map<std::array<uint32_t, 2>, std::vector<uint32_t>> edgesFaces;
+    const uint32_t none = uint32_t(-1);
+    std::vector<uint32_t> firstFace(vertsCount, none);
+    // Per undirected edge {a, b} (a = min), stored at a's adjacency slot for b.
+    std::vector<std::array<uint32_t, 2>> edgeFaces(edgesCount, {none, none});
+    Edge **matrix = adjMatrix.get();
+    Edge *base = matrix[0];
+    auto slot = [&](uint32_t a, uint32_t b) -> uint32_t {
+        uint32_t lo = std::min(a, b), hi = std::max(a, b);
+        for (Edge *e = matrix[lo]; e != matrix[lo+1]; ++e) {
+            if (e->id == hi) return uint32_t(e - base);
+        }
+        return none;
+    };
+    auto addFace = [&](uint32_t a, uint32_t b, uint32_t f) {
+        uint32_t k = slot(a, b);
+        if (k == none) return;
+        if (edgeFaces[k][0] == none) edgeFaces[k][0] = f;
+        else if (edgeFaces[k][1] == none) edgeFaces[k][1] = f;
+    };
     for (uint32_t i = 0; i < facesCount; ++i) {
         uint32_t v0 = faces[i*3+0], v1 = faces[i*3+1], v2 = faces[i*3+2];
-        vertsFaces[v0].push_back(i); vertsFaces[v1].push_back(i); vertsFaces[v2].push_back(i);
-        edgesFaces[{std::min(v0, v1), std::max(v0, v1)}].push_back(i);
-        edgesFaces[{std::min(v0, v2), std::max(v0, v2)}].push_back(i);
-        edgesFaces[{std::min(v1, v2), std::max(v1, v2)}].push_back(i);
+        if (firstFace[v0] == none) firstFace[v0] = i;
+        if (firstFace[v1] == none) firstFace[v1] = i;
+        if (firstFace[v2] == none) firstFace[v2] = i;
+        addFace(v0, v1, i);
+        addFace(v0, v2, i);
+        addFace(v1, v2, i);
     }
 
     auto getEdge = [&](uint32_t i, uint32_t j) {
@@ -566,21 +593,22 @@ void Stitcher::orderAdjacency() {
         return Edge();
     };
 
-    Parallel::For(0, vertsCount, [this, edgesTMP, &vertsFaces, &edgesFaces, &getEdge](uint32_t i) {
+    Parallel::For(0, vertsCount, [this, edgesTMP, &firstFace, &edgeFaces, &slot, &getEdge](uint32_t i) {
         uint32_t offset = adjMatrix.get()[i]-adjMatrix.get()[0];
         if (isBorder[i]) {
             for (auto n : getNeighborhood(i)) {
                 edgesTMP[offset++] = n;
             }
         } else {
-            uint32_t f = vertsFaces[i][0];
+            uint32_t f = firstFace[i];
             uint32_t v = uint32_t(-1);
 
             while(offset != adjMatrix.get()[i+1]-adjMatrix.get()[0]) {
                 if (i != faces[f*3+0] && v != faces[f*3+0]) { edgesTMP[offset++] = getEdge(i, faces[f*3+0]); v = faces[f*3+0]; }
                 else if (i != faces[f*3+1] && v != faces[f*3+1]) { edgesTMP[offset++] = getEdge(i, faces[f*3+1]); v = faces[f*3+1]; }
                 else if (i != faces[f*3+2] && v != faces[f*3+2]) { edgesTMP[offset++] = getEdge(i, faces[f*3+2]); v = faces[f*3+2]; }
-                f = edgesFaces[{std::min(i, v), std::max(i, v)}][0] != f ? edgesFaces[{std::min(i, v), std::max(i, v)}][0] : edgesFaces[{std::min(i, v), std::max(i, v)}][1];
+                const auto &ef = edgeFaces[slot(i, v)];
+                f = ef[0] != f ? ef[0] : ef[1];
             }
         }
     });

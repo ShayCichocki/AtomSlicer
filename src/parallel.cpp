@@ -10,12 +10,20 @@
 #include <thread>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+
+// Toolpath-speedup change: worker threads mark themselves, so a Parallel call made from
+// inside a pool task (e.g. per-layer Curve work run by ForEachTask) runs its chunks
+// serially, in chunk order, on that worker instead of deadlocking on the shared pool.
+// The chunk boundaries are unchanged, so per-chunk reductions give the same results.
+static thread_local bool tlInWorker = false;
 
 class ThreadPool {
 public:
     ThreadPool(size_t num_threads = std::thread::hardware_concurrency()) : pendingTask_(0), noPendingTask_(true) {
         for (size_t i = 0; i < num_threads; ++i) {
             threads_.emplace_back([this] {
+                tlInWorker = true;
                 while (true) {
                     std::function<void()> task;
                     {
@@ -98,8 +106,15 @@ private:
     std::condition_variable cvPending_;
 };
 
+// ATOM_THREADS=n caps the pool (default unchanged: hardware_concurrency).
+static size_t poolSize() {
+    const char *e = getenv("ATOM_THREADS");
+    long n = e ? atol(e) : 0;
+    return n > 0 ? size_t(n) : std::thread::hardware_concurrency();
+}
+
 static ThreadPool &getThreadPool() {
-    static ThreadPool pool;
+    static ThreadPool pool(poolSize());
     return pool;
 }
 
@@ -107,13 +122,35 @@ size_t Parallel::detail::threadCount() {
     return getThreadPool().threadCount();
 }
 
+bool Parallel::inWorker() {
+    return tlInWorker;
+}
+
+void Parallel::ForEachTask(size_t count, const std::function<void(size_t)> &task) {
+    if (tlInWorker || count <= 1) {
+        for (size_t i = 0; i < count; ++i) task(i);
+        return;
+    }
+    auto &pool = getThreadPool();
+    pool.enqueueBatch(count, task);
+    pool.sync();
+}
+
 void Parallel::detail::runChunks(size_t N, const std::function<void(size_t)> &chunk) {
+    if (tlInWorker) {
+        for (size_t t = 0; t < N; ++t) chunk(t);
+        return;
+    }
     auto &pool = getThreadPool();
     pool.enqueueBatch(N, chunk);
     pool.sync();
 }
 
 void Parallel::ForProgress(size_t start, size_t stop, std::function<void(size_t)> foo, bool quiet) {
+    if (tlInWorker) {
+        for (size_t i = start; i < stop; ++i) foo(i);
+        return;
+    }
     auto &pool = getThreadPool();
     size_t N = pool.threadCount();
     size_t grain = (stop-start)/N + ((stop-start)%N ? 1 : 0);
@@ -149,6 +186,10 @@ void Parallel::ForProgress(size_t start, size_t stop, std::function<void(size_t)
 }
 
 void Parallel::ForGrainProgress(size_t start, size_t stop, std::function<void(size_t)> foo, size_t grain, bool quiet) {
+    if (tlInWorker) {
+        for (size_t i = start; i < stop; ++i) foo(i);
+        return;
+    }
     auto &pool = getThreadPool();
     size_t N = (stop-start)/grain + ((stop-start)%grain ? 1 : 0);
     size_t done = 0;

@@ -13,6 +13,7 @@
 // per-element body is inlined; only one std::function call per chunk remains.
 // Chunking (one equal chunk per thread) is unchanged, so results are identical.
 namespace Parallel {
+    bool inWorker();
     // Ranges this small run inline on the calling thread: waking the pool costs more than the work.
     constexpr size_t kSerialBelow = 256;
 
@@ -36,6 +37,14 @@ namespace Parallel {
             }
         });
     }
+
+    // Pool size (ATOM_THREADS=n caps it; default hardware_concurrency).
+    inline size_t threadCount() { return detail::threadCount(); }
+    // True on a pool worker thread; Parallel calls made there run serially (same chunks).
+    bool inWorker();
+    // Runs task(0..count-1) as independent pool tasks (dynamic scheduling: an idle worker
+    // takes the next one). Results must be written per index; the caller orders them.
+    void ForEachTask(size_t count, const std::function<void(size_t)> &task);
 
     void ForProgress(size_t start, size_t stop, std::function<void(size_t)> foo, bool quiet = false);
     void ForGrainProgress(size_t start, size_t stop, std::function<void(size_t)> foo, size_t grain = 4096, bool quiet = false);
@@ -72,6 +81,23 @@ namespace Parallel {
         }
         size_t N = detail::threadCount();
         size_t grain = (stop-start)/N + ((stop-start)%N ? 1 : 0);
+        if (inWorker()) {
+            // Toolpath-speedup change: run inline on a worker in lockstep order (element k of
+            // every chunk, then k+1, ...), i.e. the order the N concurrent chunks take on the
+            // pool. Its one caller (Stitcher::connectRegion) writes, in a rare branch, a value
+            // that other elements of the same pass read, so the order matters: chunk-by-chunk
+            // order gave a 0.1 mm road change on one hook layer, lockstep matches the pool.
+            std::array<bool, 2> result{false, false};
+            for (size_t k = 0; k < grain; ++k) {
+                for (size_t t = 0; t < N; ++t) {
+                    size_t i = start + t*grain + k;
+                    if (i >= stop) continue;
+                    auto v = foo(i);
+                    result[0] |= v[0]; result[1] |= v[1];
+                }
+            }
+            return result;
+        }
         std::vector<uint8_t> booleans0(N), booleans1(N);
         detail::runChunks(N, [&](size_t t) {
             size_t begin = start+t*grain, end = std::min(start+(t+1)*grain, stop);

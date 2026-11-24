@@ -9,6 +9,9 @@
 #include <iomanip>
 #include <string>
 #include <sstream>
+#include <atomic>
+#include <mutex>
+#include <algorithm>
 
 Toolpath::Toolpath(const std::vector<Mesh> &layers, const SDF &sdf, const std::vector<Vec3> &points, const std::vector<Vec3> &normals, float width, float height, uint32_t hardCodedField, uint32_t zigzagOffset, bool holeClosing, bool quiet) {
     size_t travels = 0;
@@ -22,10 +25,19 @@ Toolpath::Toolpath(const std::vector<Mesh> &layers, const SDF &sdf, const std::v
         }
     }
 
-    float maxZ = 0.0f;
-    for (size_t i = 0; i < layers.size(); ++i) {
-        if (!quiet) printProgress(float(i)/(layers.size()-1));
-        if (!layers[i].vertices.size() || !layers[i].triangles.size()) continue;
+    // Toolpath-speedup change: the per-layer work (direction field, Curve = stripes +
+    // stitching + isolines, and the nearest-atom normal of every cycle point) depends only
+    // on that layer, so it runs one layer per pool task, largest layers first. The
+    // Parallel calls inside Curve run serially on the worker (same chunking, same results).
+    // The cheap, order-dependent part (start point, travels, maxZ) stays serial below, in
+    // layer order, so the waypoint sequence is unchanged.
+    struct LayerResult {
+        std::vector<std::vector<std::array<Vec3, 2>>> cycles;
+        std::vector<std::vector<uint32_t>> normalIds;   // normals[] index per cycle point
+    };
+    std::vector<LayerResult> results(layers.size());
+    auto layerWork = [&](size_t i) {
+        if (!layers[i].vertices.size() || !layers[i].triangles.size()) return;
 
         std::vector<float> directions(layers[i].vertices.size()/3, ((i+zigzagOffset) % 4) * 0.25*M_PI);
 
@@ -72,8 +84,40 @@ Toolpath::Toolpath(const std::vector<Mesh> &layers, const SDF &sdf, const std::v
         Curve curve(layers[i].vertices.data(), layers[i].vertices.size()/3, layers[i].triangles.data(), layers[i].triangles.size()/3,
                     width, sdf, directions.data(), Stripe::Printing, true, holeClosing, true);
         auto cycles = curve.getCycles();
+        auto &res = results[i];
+        res.normalIds.resize(cycles.size());
+        for (size_t c = 0; c < cycles.size(); ++c) {
+            if (cycles[c].size() < 2) continue;
+            res.normalIds[c].resize(cycles[c].size());
+            for (size_t j = 0; j < cycles[c].size(); ++j) {
+                res.normalIds[c][j] = uint32_t(bvh.nearestPointIndex(cycles[c][j][0]));
+            }
+        }
+        res.cycles = std::move(cycles);
+    };
 
-        for (const auto &cycle : cycles) {
+    std::vector<size_t> order(layers.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&layers](size_t a, size_t b) {
+        return layers[a].triangles.size() > layers[b].triangles.size();
+    });
+    std::atomic<size_t> done(0);
+    std::mutex progressMutex;
+    Parallel::ForEachTask(order.size(), [&](size_t k) {
+        layerWork(order[k]);
+        size_t n = ++done;
+        if (!quiet) {
+            std::lock_guard<std::mutex> lock(progressMutex);
+            printProgress(float(n-1)/(layers.size()-1));
+        }
+    });
+
+    float maxZ = 0.0f;
+    for (size_t i = 0; i < layers.size(); ++i) {
+        const auto &cycles = results[i].cycles;
+        for (size_t c = 0; c < cycles.size(); ++c) {
+            const auto &cycle = cycles[c];
+            const auto &normalIds = results[i].normalIds[c];
             if (cycle.size() < 2) continue;
             if (toolpath.size()) lastPoint = toolpath.back().position;
             size_t closestIdx = 0;
@@ -90,7 +134,7 @@ Toolpath::Toolpath(const std::vector<Mesh> &layers, const SDF &sdf, const std::v
                 Vec3 pos0 =  toolpath.back().position;
                 Vec3 norm0 = toolpath.back().normal;
                 Vec3 pos1 = cycle[closestIdx][0];
-                Vec3 norm1 = normals[bvh.nearestPointIndex(pos1)];
+                Vec3 norm1 = normals[normalIds[closestIdx]];
                 float z = std::max(maxZ, pos1.z) + 4.0*width;
                 pos0 += ((z-pos0.z)/fabsf(norm0.z))*norm0;
                 pos1 += ((z-pos1.z)/fabsf(norm1.z))*norm1;
@@ -112,7 +156,7 @@ Toolpath::Toolpath(const std::vector<Mesh> &layers, const SDF &sdf, const std::v
             for (size_t j = 0; j < cycle.size(); ++j) {
                 size_t idx = (closestIdx + j) % cycle.size();
                 Vec3 pos = cycle[idx][0];
-                Vec3 norm = normals[bvh.nearestPointIndex(cycle[idx][0])];
+                Vec3 norm = normals[normalIds[idx]];
                 maxZ = std::max(maxZ, pos.z);
                 toolpath.push_back({pos+0.5*height*norm, norm, j > 0});
             }

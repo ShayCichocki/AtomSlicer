@@ -303,7 +303,7 @@ struct SdfInfoGpu {   // must match SdfInfo in kernels.metal
 };
 
 bool Gpu::sdf(const std::vector<float> &nodeBox, const std::vector<uint32_t> &nodeInfo, const std::vector<float> &triVerts,
-              const SdfParams &p, float *field, bool progress) {
+              const SdfParams &p, float *field, bool progress, const SdfRayTree *rayTree) {
     Ctx &c = ctx();
     if (!c.ok) return false;
     {
@@ -319,17 +319,30 @@ bool Gpu::sdf(const std::vector<float> &nodeBox, const std::vector<uint32_t> &no
         id<MTLBuffer> bTris = [c.device newBufferWithBytes:triVerts.data() length:triVerts.size()*sizeof(float) options:MTLResourceStorageModeShared];
         id<MTLBuffer> bField = [c.device newBufferWithLength:cells*sizeof(float) options:MTLResourceStorageModeShared];
         if (!bBox || !bInfo || !bTris || !bField) return false;
+        // Toolpath-speedup change: ray tree buffers (1-element dummies when not used).
+        bool useTree = rayTree && !rayTree->info.empty() && !getenv("ATOM_SDF_NO_RAYTREE");
+        static const uint32_t dummy[8] = {0};
+        auto buf = [&](const void *d, size_t n) { return [c.device newBufferWithBytes:(n ? d : dummy) length:(n ? n : sizeof(dummy)) options:MTLResourceStorageModeShared]; };
+        id<MTLBuffer> bRBox = buf(useTree ? rayTree->box.data() : nullptr, useTree ? rayTree->box.size()*4 : 0);
+        id<MTLBuffer> bRInfo = buf(useTree ? rayTree->info.data() : nullptr, useTree ? rayTree->info.size()*4 : 0);
+        id<MTLBuffer> bRLeaves = buf(useTree ? rayTree->leaves.data() : nullptr, useTree ? rayTree->leaves.size()*4 : 0);
+        id<MTLBuffer> bParent = buf(useTree ? rayTree->parent.data() : nullptr, useTree ? rayTree->parent.size()*4 : 0);
+        if (!bRBox || !bRInfo || !bRLeaves || !bParent) return false;
         SdfInfoGpu info{};
+        info.pad = useTree ? 1u : 0u;
         info.sx = p.size[0]; info.sy = p.size[1]; info.sz = p.size[2]; info.raysCount = p.raysCount;
         info.cellSize = p.cellSize; info.half = p.half; info.ox = p.offset[0]; info.oy = p.offset[1]; info.oz = p.offset[2];
         info.tri0x = p.tri0[0]; info.tri0y = p.tri0[1]; info.tri0z = p.tri0[2];
         info.eps_hi = float(1e-4); info.eps_lo = float(1e-4 - double(info.eps_hi));
         id<MTLComputePipelineState> pipe = c.pipes[kSdfKernel];
         // Chunks keep each command buffer short (GPU watchdog) and drive the progress bar.
-        const size_t chunk = size_t(1) << 20;
+        // Toolpath-speedup change: the kernel takes blocks of 4 x 8 rows x 8 z cells (32 threads
+        // each), see sdf_cells; a chunk is 4096 blocks (2^20 cells, as before).
+        const size_t nb = size_t((p.size[0]+3)/4) * ((p.size[1]+7)/8) * ((p.size[2]+7)/8);
+        const size_t chunk = size_t(1) << 12;
         std::vector<id<MTLCommandBuffer>> cbs;
-        for (size_t first = 0; first < cells; first += chunk) {
-            uint32_t f = uint32_t(first), n = uint32_t(std::min(chunk, cells - first));
+        for (size_t first = 0; first < nb; first += chunk) {
+            uint32_t f = uint32_t(first), n = uint32_t(std::min(chunk, nb - first));
             id<MTLCommandBuffer> cb = [c.queue commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
             [enc setComputePipelineState:pipe];
@@ -340,8 +353,13 @@ bool Gpu::sdf(const std::vector<float> &nodeBox, const std::vector<uint32_t> &no
             [enc setBuffer:bField offset:0 atIndex:4];
             [enc setBytes:&f length:sizeof(f) atIndex:5];
             [enc setBytes:&n length:sizeof(n) atIndex:6];
+            [enc setBuffer:bRBox offset:0 atIndex:7];
+            [enc setBuffer:bRInfo offset:0 atIndex:8];
+            [enc setBuffer:bRLeaves offset:0 atIndex:9];
+            [enc setBuffer:bParent offset:0 atIndex:10];
             NSUInteger tg = std::min<NSUInteger>(pipe.maxTotalThreadsPerThreadgroup, 64);
-            [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+            tg = tg >= 32 ? tg - tg % 32 : tg;
+            [enc dispatchThreads:MTLSizeMake(size_t(n)*32, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
             [enc endEncoding];
             [cb commit];
             cbs.push_back(cb);

@@ -36,3 +36,11 @@ if (ATOM_METAL)
     set_source_files_properties(src/metal/gpu.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc -O3 -std=c++17")
     target_link_libraries(slicer PRIVATE "-framework Metal" "-framework Foundation")
 endif()
+
+# partition-wip: Partition-only harness (reads an ATOM_PART_DUMP file). PARTITION_SRC lets the
+# same harness be built against another partition.cpp (e.g. the unmodified one) for A/B runs.
+set(PARTITION_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/partition.cpp CACHE FILEPATH "partition.cpp for partbench")
+add_executable(partbench tools/partbench.cpp ${PARTITION_SRC} src/parallel.cpp)
+get_filename_component(PARTITION_INC ${PARTITION_SRC} DIRECTORY)
+target_include_directories(partbench PRIVATE ${PARTITION_INC} ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(partbench PUBLIC -Wall -O3 -march=native)
