@@ -2,9 +2,9 @@
 
 Status: **the CUDA build has never been compiled by nvcc or run on an NVIDIA GPU.** The Mac has no NVIDIA GPU and no toolkit. What was checked on the Mac is in `CUDA_LOG.md`: the same host code and kernels ran through a CPU emulation of CUDA, and clang compiled the `.cu` file for sm_89. The steps below are the first real test. Run the equivalence script (step 5) before using the GPU build for anything.
 
-Source: branch `fiveax-cuda` of https://github.com/ShayCichocki/AtomSlicer (the Metal fork plus the CUDA backend). Inside WSL, clone it under `~/`, not `/mnt/c/...`: building on the Windows filesystem is several times slower:
+Source: `main` of https://github.com/ShayCichocki/AtomSlicer (Metal + CPU speed-ups + the CUDA backend). Inside WSL, clone it under `~/`, not `/mnt/c/...`: building on the Windows filesystem is several times slower:
 ```bash
-cd ~ && git clone -b fiveax-cuda https://github.com/ShayCichocki/AtomSlicer.git AtomSlicer-cuda
+cd ~ && git clone https://github.com/ShayCichocki/AtomSlicer.git AtomSlicer-cuda
 ```
 
 ## What you need

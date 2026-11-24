@@ -13,6 +13,11 @@ five-axis FDM pipeline. Everything is opt-in: a default build is upstream's CPU 
   the tangent slot is the in-layer direction ACROSS the roads (n x road).
 - **`-W out.fxwp`**: raw waypoints (position, nozzle axis, deposit flag) in the STL frame, for an
   external exporter/verifier.
+- **CUDA backend** (`-DATOM_CUDA=ON`, default arch sm_89 / RTX 40xx) with a CPU emulation build
+  (`-DATOM_CUDA_EMU=ON`) used to verify it without an NVIDIA GPU. Not yet run on NVIDIA hardware:
+  see `CUDA_BUILD.md` and `test/cuda_desktop.sh`.
+- **Faster CPU stages** (partitioning ~20x, toolpath generation 2-6x, SDF ~1.7x) with byte-identical
+  output: see `SPEEDUPS.md`. `ATOM_THREADS=n` caps the thread pool.
 - **Tests** (`test/`): fixtures, `compare.py` (CPU vs GPU waypoint comparison with a float-noise-floor
   verdict), `run_bench.sh`, `make_fixtures.py`, `make_field.py`.
 
