@@ -93,13 +93,16 @@ void TriPhasor::extractAtoms(const SDF &sdf, GridHierarchy<Data> &grid, float la
 #ifdef ATOM_METAL
     std::vector<float, Gpu::PageAllocator<float>> maxVal(grid.getTotalSize(), -std::numeric_limits<float>::infinity());
     std::vector<Vec3, Gpu::PageAllocator<Vec3>> maxPos(grid.getTotalSize(), Vec3(std::numeric_limits<float>::quiet_NaN()));
+#else
+    std::vector<float> maxVal(grid.getTotalSize(), -std::numeric_limits<float>::infinity());
+    std::vector<Vec3> maxPos(grid.getTotalSize(), Vec3(std::numeric_limits<float>::quiet_NaN()));
+#endif
+#ifdef ATOM_GPU
+    static_assert(sizeof(Vec3) == 3*sizeof(float), "maxPos is read as 3 floats per cell");
     bool onGpu = grid.useGpu() && Gpu::extractAtoms(grid.gpuDesc(), layerHeight, cellSizeFromLayerHeight(layerHeight) * (0.5f-0.5f/8),
                                                     maxVal.data(), &maxPos.data()->x);
     if (onGpu) printProgress(1.0);
     else
-#else
-    std::vector<float> maxVal(grid.getTotalSize(), -std::numeric_limits<float>::infinity());
-    std::vector<Vec3> maxPos(grid.getTotalSize(), Vec3(std::numeric_limits<float>::quiet_NaN()));
 #endif
     Parallel::ForProgress(0, grid.getTotalSize(), [&grid, &maxVal, &maxPos, layerHeight](size_t i) {
         if (isOutside(grid.getData(i)->flags)) return;
