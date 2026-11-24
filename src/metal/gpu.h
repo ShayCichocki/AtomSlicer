@@ -1,15 +1,22 @@
 // MIT License
-// GPU (Metal) backend interface for the AtomSlicer grid smoothers.
-// Built only with -DATOM_METAL=ON; otherwise every call reports "not available" and the
-// callers run their original CPU code. At run time, ATOM_METAL=0 in the environment
-// also forces the CPU path (handy for A/B tests with one binary).
+// GPU backend interface for the AtomSlicer grid smoothers.
+// Implemented by the Metal backend (-DATOM_METAL=ON, src/metal/gpu.mm) or the CUDA backend
+// (-DATOM_CUDA=ON, src/cuda/gpu_cuda.cu; -DATOM_CUDA_EMU=ON runs that same code on the CPU).
+// Without either, every call reports "not available" and the callers run their original CPU
+// code. At run time ATOM_METAL=0 / ATOM_CUDA=0 in the environment also forces the CPU path.
 #pragma once
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <new>
-#include <unistd.h>
 #include <vector>
+#ifdef ATOM_METAL
+#include <unistd.h>
+#endif
+
+#if defined(ATOM_METAL) || defined(ATOM_CUDA)
+#define ATOM_GPU 1
+#endif
 
 namespace Gpu {
 
@@ -33,7 +40,7 @@ struct GridDesc {
     float origin[3];
 };
 
-#ifdef ATOM_METAL
+#ifdef ATOM_GPU
 bool available();
 // 2*iterationCount red-black half-sweeps (parity 0,1,0,1,...), as GridHierarchy::smooth.
 bool smooth(Kernel k, const GridDesc &g, const float *params, uint32_t nparams, uint32_t iterationCount, bool progress);
@@ -64,6 +71,7 @@ inline long smoothConvergence(Kernel, const GridDesc &, const float *, uint32_t)
 inline size_t minCells() { return size_t(-1); }
 #endif
 
+#ifdef ATOM_METAL
 // Page-aligned allocator so std::vector storage can be wrapped as a shared MTLBuffer
 // without a copy (newBufferWithBytesNoCopy needs page alignment and page-multiple length).
 inline size_t pageSize() { static size_t p = size_t(getpagesize()); return p; }
@@ -83,5 +91,7 @@ struct PageAllocator {
     template <class U> bool operator==(const PageAllocator<U> &) const { return true; }
     template <class U> bool operator!=(const PageAllocator<U> &) const { return false; }
 };
+
+#endif
 
 }

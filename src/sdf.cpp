@@ -33,7 +33,7 @@ SDF::SDF(const std::vector<std::array<Vec3, 3>> &triangles, float cellSize, uint
         field[i] = sign * delta.length();
     };
 
-    // Metal port: same per-cell computation on the GPU; cells whose BVH stack overflowed
+    // GPU port (Metal or CUDA): same per-cell computation on the GPU; cells whose BVH stack overflowed
     // come back NaN and are redone here.
     if (Gpu::available() && field.size() >= Gpu::minCells()) {
         std::vector<float> nodeBox, triVerts;
@@ -48,7 +48,7 @@ SDF::SDF(const std::vector<std::array<Vec3, 3>> &triangles, float cellSize, uint
             std::vector<size_t> redo;
             for (size_t i = 0; i < field.size(); ++i) if (std::isnan(field[i])) redo.push_back(i);
             if (redo.size()) {
-                fprintf(stderr, "[metal] sdf: %zu cells redone on CPU (BVH stack)\n", redo.size());
+                fprintf(stderr, "[gpu] sdf: %zu cells redone on CPU (BVH stack)\n", redo.size());
                 Parallel::For(0, redo.size(), [&](size_t k) { cellValue(redo[k]); });
             }
             return;
