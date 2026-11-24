@@ -5,14 +5,15 @@
 #        NEW=path/to/new/slicer   (default build/slicer)
 #        ARGS="-d 0.4 -h 0.5 -o 1 -i 0"   slicer options (-W is added)
 #        REUSE_REF=1   reuse a cached ref run for the same fixture+ARGS
-#        NOLOG=1       print the table only, do not append to METAL_LOG.md
+#        NOLOG=1       print the table only, do not append to the log
+#        PY=python3    interpreter with numpy+scipy;  LOG=file  log to append to (default METAL_LOG.md)
 #        FLOOR=path    CPU build with -ffp-contract=off (default build-perturb/slicer): its
 #                      output vs ref is the float noise floor (cached per fixture)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-PY=/Users/scichocki/personal/cad-box/.venv/bin/python
-LOG=/Users/scichocki/personal/cad-box/five-axis-printer/docs/METAL_LOG.md
+PY="${PY:-python3}"              # needs numpy + scipy
+LOG="${LOG:-$ROOT/METAL_LOG.md}"   # benchmark log to append to
 REF="${REF:-$ROOT/build-ref/slicer}"
 NEW="${NEW:-$ROOT/build/slicer}"
 ARGS="${ARGS:--d 0.4 -h 0.5 -o 1 -i 0}"
