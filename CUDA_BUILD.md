@@ -2,7 +2,10 @@
 
 Status: **the CUDA build has never been compiled by nvcc or run on an NVIDIA GPU.** The Mac has no NVIDIA GPU and no toolkit. What was checked on the Mac is in `CUDA_LOG.md`: the same host code and kernels ran through a CPU emulation of CUDA, and clang compiled the `.cu` file for sm_89. The steps below are the first real test. Run the equivalence script (step 5) before using the GPU build for anything.
 
-Source: `five-axis-printer/vendor/AtomSlicer-cuda-wip/`. This is a copy of the Metal fork with the CUDA backend added. It is not committed to git yet; that waits for your go-ahead. Copy the whole folder to the desktop, for example with `scp -r`, a USB stick or a OneDrive folder. Inside WSL, put it under `~/`, not `/mnt/c/...`: building on the Windows filesystem is several times slower.
+Source: branch `fiveax-cuda` of https://github.com/ShayCichocki/AtomSlicer (the Metal fork plus the CUDA backend). Inside WSL, clone it under `~/`, not `/mnt/c/...`: building on the Windows filesystem is several times slower:
+```bash
+cd ~ && git clone -b fiveax-cuda https://github.com/ShayCichocki/AtomSlicer.git AtomSlicer-cuda
+```
 
 ## What you need
 
@@ -41,9 +44,9 @@ Why: upstream AtomSlicer and our fork are developed with GCC/clang and CMake on 
    ```bash
    python3 -m venv ~/atomvenv && ~/atomvenv/bin/pip install numpy scipy
    ```
-5. **Build everything and prove equivalence** (from the copied folder):
+5. **Build everything and prove equivalence** (from the clone):
    ```bash
-   cd ~/AtomSlicer-cuda-wip
+   cd ~/AtomSlicer-cuda
    PY=~/atomvenv/bin/python JOBS=16 test/cuda_desktop.sh
    ```
    The script builds three binaries: `build-cpu/` (the CPU reference), `build-floor/` (the CPU reference with `-ffp-contract=off`, used as the float noise floor) and `build-cuda/` (`-DATOM_CUDA=ON`). It runs a smoke test on `test/cube6.stl` with per-kernel timings, then runs cube6, cube20, holed_block and curved_bar through the CPU build, the floor build, the CUDA build and the CUDA build with `ATOM_CUDA_EXACT=1`. It writes `test/out-cuda/report.md` with two tables: a compare table (verdict, position, axis, volume, coverage, layers, backend line) and a timing table (per stage, wall clock and peak RSS). The whole run takes roughly 10 to 30 minutes, most of it the CPU reference. Send that file back.
